@@ -1,26 +1,15 @@
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
-const liveCanvas = document.getElementById('liveCanvas');
-const liveCtx = liveCanvas.getContext('2d');
-
-const remoteCanvas = document.createElement('canvas');
-remoteCanvas.width = canvas.width;
-remoteCanvas.height = canvas.height;
-remoteCanvas.className = 'remote-live-canvas';
-canvas.parentElement.appendChild(remoteCanvas);
-const remoteCtx = remoteCanvas.getContext('2d');
 const viewport = document.getElementById('viewport');
 const stage = document.getElementById('stage');
 
 const colorInput = document.getElementById('color');
 const sizeInput = document.getElementById('size');
-const eraserSizeInput = document.getElementById('eraserSize');
 const opacityInput = document.getElementById('opacity');
 const smoothingInput = document.getElementById('smoothing');
 
 const sizeValue = document.getElementById('sizeValue');
-const eraserSizeValue = document.getElementById('eraserSizeValue');
 const opacityValue = document.getElementById('opacityValue');
 const smoothingValue = document.getElementById('smoothingValue');
 const hexValue = document.getElementById('hexValue');
@@ -35,7 +24,6 @@ const addLayerBtn = document.getElementById('addLayerBtn');
 const chatMessagesEl = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const chatSendBtn = document.getElementById('chatSendBtn');
-const brushCursor = document.getElementById('brushCursor');
 
 const lobbyOverlay = document.getElementById('lobbyOverlay');
 const lobbyNickname = document.getElementById('lobbyNickname');
@@ -45,17 +33,6 @@ const myNicknameEl = document.getElementById('myNickname');
 
 
 const WIDTH = canvas.width, HEIGHT = canvas.height;
-
-const strokeBuffer = document.createElement('canvas');
-strokeBuffer.width = WIDTH;
-strokeBuffer.height = HEIGHT;
-const strokeBufferCtx = strokeBuffer.getContext('2d');
-
-let currentStrokeOpacity = 1;
-let currentStrokeIsEraser = false;
-
-const remoteStrokeBuffers = new Map();
-
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
 
 let tool = 'brush';
@@ -70,11 +47,6 @@ let smoothPoint = null;
 let currentStrokeId = null;
 let currentStrokeSegments = [];
 let activePointerId = null;
-let rawPointHistory = [];
-let networkSegmentBuffer = [];
-let networkFlushTimer = null;
-let lastInputTime = 0;
-let rejectedJumpCount = 0;
 let expiresAt = Date.now() + ROOM_LIFETIME_MS;
 let cachedRows = [];
 
@@ -179,10 +151,6 @@ addLayerBtn.onclick = ()=>{
 renderLayers();
 
 function clearCanvas(){
-  remoteStrokeBuffers.clear();
-  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
-
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -192,61 +160,9 @@ function clearCanvas(){
 }
 clearCanvas();
 
-
-function updateBrushCursorSize(){
-  if(!brushCursor) return;
-
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = rect.width / WIDTH;
-  const scaleY = rect.height / HEIGHT;
-  const scale = (scaleX + scaleY) / 2;
-
-  const logicalSize = tool === 'eraser'
-    ? Number(eraserSizeInput.value)
-    : Number(sizeInput.value);
-  const px = Math.max(4, logicalSize * scale);
-  brushCursor.style.width = `${px}px`;
-  brushCursor.style.height = `${px}px`;
-
-  brushCursor.classList.toggle('eraser', tool === 'eraser');
-  brushCursor.classList.toggle('hand', tool === 'hand');
-}
-
-function moveBrushCursor(e){
-  if(!brushCursor) return;
-  if(tool === 'hand'){
-    brushCursor.style.display = 'none';
-    return;
-  }
-
-  const viewportRect = viewport.getBoundingClientRect();
-  const canvasRect = canvas.getBoundingClientRect();
-
-  const insideCanvas =
-    e.clientX >= canvasRect.left &&
-    e.clientX <= canvasRect.right &&
-    e.clientY >= canvasRect.top &&
-    e.clientY <= canvasRect.bottom;
-
-  if(!insideCanvas){
-    brushCursor.style.display = 'none';
-    return;
-  }
-
-  brushCursor.style.display = 'block';
-  brushCursor.style.left = `${e.clientX - viewportRect.left}px`;
-  brushCursor.style.top = `${e.clientY - viewportRect.top}px`;
-  updateBrushCursorSize();
-}
-
-function hideBrushCursor(){
-  if(brushCursor) brushCursor.style.display = 'none';
-}
-
 function updateTransform(){
   stage.style.transform = `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${zoom})`;
   zoomLabel.textContent = `${Math.round(zoom*100)}%`;
-  updateBrushCursorSize();
 }
 
 function canvasPointFromEvent(e){
@@ -259,162 +175,45 @@ function canvasPointFromEvent(e){
 }
 
 function getStyledWidth(pressure){
-  const base = tool === 'eraser'
-    ? Number(eraserSizeInput.value)
-    : Number(sizeInput.value);
-
-  if(tool !== 'eraser' && brushType === 'pressure'){
-    return Math.max(1, base * (.25 + pressure * 1.1));
-  }
-
+  const base = Number(sizeInput.value);
+  if(brushType === 'pressure') return Math.max(1, base * (.25 + pressure * 1.1));
   return base;
 }
 
 function smooth(raw){
   const amount = Number(smoothingInput.value) / 100;
 
-  if(amount <= 0){
-    smoothPoint = {...raw};
-    return {...raw};
-  }
-
   if(!smoothPoint){
     smoothPoint = {...raw};
     return {...raw};
   }
 
-  // 너무 뒤처지지 않는 가벼운 보정
-  const follow = 1 - amount * 0.45;
+  // 초반 버전 느낌에 가깝게:
+  // 보정은 가볍게만 적용하고 손 위치를 크게 뒤쫓지 않음.
+  const alpha = 1 - (amount * 0.55);
 
   smoothPoint = {
-    x:smoothPoint.x + (raw.x - smoothPoint.x) * follow,
-    y:smoothPoint.y + (raw.y - smoothPoint.y) * follow,
-    pressure:raw.pressure
+    x: smoothPoint.x + (raw.x - smoothPoint.x) * alpha,
+    y: smoothPoint.y + (raw.y - smoothPoint.y) * alpha,
+    pressure: raw.pressure
   };
 
   return {...smoothPoint};
 }
 
-function drawOpaqueSegment(targetCtx, seg){
-  targetCtx.save();
-  targetCtx.globalCompositeOperation = 'source-over';
-  targetCtx.globalAlpha = 1;
-  targetCtx.strokeStyle = seg.eraser ? '#ffffff' : seg.color;
-  targetCtx.lineCap = 'round';
-  targetCtx.lineJoin = 'round';
-  targetCtx.beginPath();
-  targetCtx.moveTo(seg.x1,seg.y1);
-  targetCtx.lineTo(seg.x2,seg.y2);
-  targetCtx.lineWidth = seg.width;
-  targetCtx.stroke();
-  targetCtx.restore();
-}
-
-function drawStrokeSegments(targetCtx, segments){
-  if(!segments || !segments.length) return;
-
-  strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
-
-  // 한 획 전체를 먼저 100% 불투명으로 만든다.
-  segments.forEach(seg=>{
-    drawOpaqueSegment(strokeBufferCtx, seg);
-  });
-
-  const first = segments[0];
-  const alpha = first.eraser ? 1 : Number(first.opacity ?? 1);
-
-  targetCtx.save();
-  targetCtx.globalAlpha = alpha;
-  targetCtx.globalCompositeOperation = 'source-over';
-  targetCtx.drawImage(strokeBuffer,0,0);
-  targetCtx.restore();
-
-  strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
-}
-
 function drawSegment(seg){
-  drawStrokeSegments(ctx,[seg]);
-}
-
-
-function redrawRemoteStrokes(){
-  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
-
-  for(const stroke of remoteStrokeBuffers.values()){
-    if(!stroke.segments.length) continue;
-
-    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
-
-    stroke.segments.forEach(seg=>{
-      drawOpaqueSegment(strokeBufferCtx, seg);
-    });
-
-    remoteCtx.save();
-    remoteCtx.globalAlpha = stroke.eraser ? 1 : stroke.opacity;
-    remoteCtx.globalCompositeOperation = 'source-over';
-    remoteCtx.drawImage(strokeBuffer,0,0);
-    remoteCtx.restore();
-
-    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
-  }
-}
-
-function receiveRemoteStrokeBatch(payload){
-  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
-  if(!segments.length) return;
-
-  const strokeId = segments[0]?.strokeId || payload.strokeId;
-  if(!strokeId) return;
-
-  let stroke = remoteStrokeBuffers.get(strokeId);
-
-  if(!stroke){
-    const first = segments[0];
-    stroke = {
-      ownerId:payload.ownerId,
-      layerNo:Number(payload.layerNo || 1),
-      opacity:Number(first.opacity ?? 1),
-      eraser:Boolean(first.eraser),
-      segments:[]
-    };
-    remoteStrokeBuffers.set(strokeId, stroke);
-  }
-
-  stroke.segments.push(...segments);
-  redrawRemoteStrokes();
-}
-
-function finishRemoteStroke(payload){
-  const strokeId = payload?.strokeId;
-  if(!strokeId) return;
-
-  const stroke = remoteStrokeBuffers.get(strokeId);
-
-  // stroke_end에는 전체 획도 같이 보내므로,
-  // 중간 broadcast가 일부 유실되어도 최종 모양은 정확하게 복구.
-  const fullSegments = Array.isArray(payload?.segments) && payload.segments.length
-    ? payload.segments
-    : stroke?.segments;
-
-  if(fullSegments?.length){
-    drawStrokeSegments(ctx, fullSegments);
-  }
-
-  remoteStrokeBuffers.delete(strokeId);
-  redrawRemoteStrokes();
-}
-
-function redrawLiveStroke(){
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
-  if(!currentStrokeSegments.length) return;
-
-  // liveCanvas 자체는 불투명한 한 획.
-  // 투명도는 CSS가 아니라 병합할 때 한 번만 적용한다.
-  currentStrokeSegments.forEach(seg=>{
-    drawOpaqueSegment(liveCtx, seg);
-  });
-
-  liveCanvas.style.opacity = String(currentStrokeIsEraser ? 1 : currentStrokeOpacity);
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = seg.opacity;
+  ctx.strokeStyle = seg.eraser ? '#fff' : seg.color;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(seg.x1,seg.y1);
+  ctx.lineTo(seg.x2,seg.y2);
+  ctx.lineWidth = seg.width;
+  ctx.stroke();
+  ctx.restore();
 }
 
 function rowVisible(row){
@@ -436,7 +235,7 @@ function redrawFromCache(){
     if(!rowVisible(row)) return;
     const payload = row.payload || {};
     if(payload.type === 'stroke' && Array.isArray(payload.segments)){
-      drawStrokeSegments(ctx, payload.segments);
+      payload.segments.forEach(drawSegment);
     }
   });
 }
@@ -806,23 +605,8 @@ async function connectRoomChannel(){
 
   channel
     .on('broadcast',{event:'stroke'}, ({payload}) => {
-      // 이전 버전 클라이언트 호환
-      if(payload.ownerId === myId) return;
-      if(payload.segment){
-        receiveRemoteStrokeBatch({
-          ownerId:payload.ownerId,
-          layerNo:payload.layerNo,
-          segments:[payload.segment]
-        });
-      }
-    })
-    .on('broadcast',{event:'stroke_batch'}, ({payload}) => {
-      if(payload.ownerId === myId) return;
-      receiveRemoteStrokeBatch(payload);
-    })
-    .on('broadcast',{event:'stroke_end'}, ({payload}) => {
-      if(payload.ownerId === myId) return;
-      finishRemoteStroke(payload);
+      if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
+      drawSegment(payload.segment);
     })
     .on('broadcast',{event:'owner_clear'}, async () => {
       await loadRoomHistory();
@@ -1075,40 +859,8 @@ function isInsideCanvasPoint(p){
   return p.x >= 0 && p.x <= WIDTH && p.y >= 0 && p.y <= HEIGHT;
 }
 
-
-function queueNetworkSegment(seg){
-  networkSegmentBuffer.push(seg);
-
-  if(networkFlushTimer !== null) return;
-
-  networkFlushTimer = window.setTimeout(()=>{
-    flushNetworkSegments();
-  }, 30);
-}
-
-function flushNetworkSegments(){
-  if(networkFlushTimer !== null){
-    clearTimeout(networkFlushTimer);
-    networkFlushTimer = null;
-  }
-
-  if(!networkSegmentBuffer.length) return;
-
-  const segments = networkSegmentBuffer.splice(0, networkSegmentBuffer.length);
-
-  broadcast('stroke_batch',{
-    ownerId:myId,
-    layerNo:activeLayer,
-    segments
-  });
-}
-
 function emitDrawPoint(rawPoint){
   if(!isInsideCanvasPoint(rawPoint)) return;
-
-  const now = performance.now();
-  const dt = lastInputTime ? Math.max(1, now - lastInputTime) : 16;
-  lastInputTime = now;
 
   const p = smooth(rawPoint);
 
@@ -1117,49 +869,44 @@ function emitDrawPoint(rawPoint){
     return;
   }
 
-  const distance = Math.hypot(p.x-lastPoint.x, p.y-lastPoint.y);
-  const speed = distance / dt; // canvas px per millisecond
+  const dx = p.x - lastPoint.x;
+  const dy = p.y - lastPoint.y;
+  const distance = Math.hypot(dx, dy);
 
-  // 비정상적인 순간 좌표 튐 제거:
-  // 아주 짧은 시간에 큰 거리가 순간이동한 경우만 버림.
-  const impossibleJump =
-    (dt <= 8 && distance > 55) ||
-    (dt <= 16 && distance > 110) ||
-    speed > 9.5 ||
-    distance > 240;
-
-  if(impossibleJump){
-    rejectedJumpCount++;
+  // 브라우저 좌표가 비정상적으로 크게 튈 때만 연결 끊기
+  if(distance > 180){
     smoothPoint = {...rawPoint};
     lastPoint = {...rawPoint};
     return;
   }
 
   const seg = {
-    strokeId:currentStrokeId,
-    x1:lastPoint.x,
-    y1:lastPoint.y,
-    x2:p.x,
-    y2:p.y,
-    width:getStyledWidth(p.pressure),
-    color:colorInput.value,
-    opacity:Number(opacityInput.value)/100,
-    eraser:tool==='eraser'
+    strokeId: currentStrokeId,
+    x1: lastPoint.x,
+    y1: lastPoint.y,
+    x2: p.x,
+    y2: p.y,
+    width: getStyledWidth(p.pressure),
+    color: colorInput.value,
+    opacity: Number(opacityInput.value) / 100,
+    eraser: tool === 'eraser'
   };
 
-  // 로컬 한 획은 liveCanvas에서 다시 그린다.
-  // 반투명 조각들이 서로 겹치지 않도록 전체 획을 한 번에 표시.
-  currentStrokeSegments.push(seg);
-  redrawLiveStroke();
-  queueNetworkSegment(seg);
+  drawSegment(seg);
 
+  broadcast('stroke',{
+    ownerId: myId,
+    layerNo: activeLayer,
+    segment: seg
+  });
+
+  currentStrokeSegments.push(seg);
   lastPoint = p;
 }
 
 let lastPoint = null;
 
 canvas.addEventListener('pointerdown', e=>{
-  if(e.pointerType === 'mouse' && e.button !== 0) return;
   if(spaceDown || tool==='hand'){
     panning = true;
     panStart = {x:e.clientX-pan.x,y:e.clientY-pan.y};
@@ -1173,18 +920,8 @@ canvas.addEventListener('pointerdown', e=>{
   activePointerId = e.pointerId;
   drawing = true;
   smoothPoint = null;
-  rawPointHistory = [];
-  networkSegmentBuffer = [];
-  if(networkFlushTimer !== null){
-    clearTimeout(networkFlushTimer);
-    networkFlushTimer = null;
-  }
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
-  currentStrokeOpacity = tool === 'eraser' ? 1 : Number(opacityInput.value)/100;
-  currentStrokeIsEraser = tool === 'eraser';
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
-  liveCanvas.style.opacity = String(currentStrokeOpacity);
 
   const start = canvasPointFromEvent(e);
   if(!isInsideCanvasPoint(start)){
@@ -1195,15 +932,11 @@ canvas.addEventListener('pointerdown', e=>{
 
   smoothPoint = {...start};
   lastPoint = {...start};
-  lastInputTime = performance.now();
 
   canvas.setPointerCapture?.(e.pointerId);
 });
 
-
-
-
-function handleDrawMove(e){
+canvas.addEventListener('pointermove', e=>{
   if(panning && panStart){
     pan.x = e.clientX-panStart.x;
     pan.y = e.clientY-panStart.y;
@@ -1213,88 +946,63 @@ function handleDrawMove(e){
 
   if(!drawing || e.pointerId !== activePointerId) return;
 
-  // 마우스/펜은 손을 뗀 뒤 hover pointermove가 계속 들어올 수 있음.
-  // buttons=0이면 더 이상 실제로 누르고 있는 상태가 아니므로 즉시 종료.
-  if((e.pointerType === 'mouse' || e.pointerType === 'pen') && e.buttons === 0){
-    finishStrokeImmediately(e.pointerId);
-    return;
-  }
-
-  e.preventDefault();
-
   const p = canvasPointFromEvent(e);
   if(!isInsideCanvasPoint(p)) return;
 
   emitDrawPoint(p);
-}
-
-// 안정성을 위해 pointermove만 사용.
-canvas.addEventListener('pointermove', handleDrawMove, {passive:false});
-
-
-async function saveFinishedStroke(segments){
-  if(!segments || !segments.length) return;
-  await persistStroke(segments);
-}
-
-function finishStrokeImmediately(pointerId){
-  if(activePointerId === null) return;
-  if(pointerId !== undefined && pointerId !== null && pointerId !== activePointerId) return;
-
-  const segmentsToSave = currentStrokeSegments.slice();
-
-  // 손을 떼는 순간 현재 live 획을 메인 캔버스에 단 한 번 합성.
-  if(segmentsToSave.length){
-    ctx.save();
-    ctx.globalAlpha = currentStrokeIsEraser ? 1 : currentStrokeOpacity;
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(liveCanvas,0,0);
-    ctx.restore();
-  }
-
-  if(segmentsToSave.length){
-    broadcast('stroke_end',{
-      ownerId:myId,
-      layerNo:activeLayer,
-      strokeId:segmentsToSave[0]?.strokeId,
-      segments:segmentsToSave
-    });
-  }
-
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
-  liveCanvas.style.opacity = '1';
-
-  drawing = false;
-  activePointerId = null;
-  panning = false;
-  panStart = null;
-  smoothPoint = null;
-  rawPointHistory = [];
-  lastPoint = null;
-  lastInputTime = 0;
-
-  flushNetworkSegments();
-  currentStrokeSegments = [];
-
-  canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
-
-  if(segmentsToSave.length){
-    saveFinishedStroke(segmentsToSave);
-  }
-}
-
-window.addEventListener('pointerup', e=>{
-  finishStrokeImmediately(e.pointerId);
 });
 
+window.addEventListener('pointerup', async e=>{
+  if(e.pointerId !== activePointerId){
+    panning=false;
+    panStart=null;
+    return;
+  }
+
+  if(drawing){
+    if(currentStrokeSegments.length === 0 && lastPoint){
+      const seg = {
+        strokeId: currentStrokeId,
+        x1: lastPoint.x - 0.01,
+        y1: lastPoint.y,
+        x2: lastPoint.x + 0.01,
+        y2: lastPoint.y,
+        width: getStyledWidth(lastPoint.pressure),
+        color: colorInput.value,
+        opacity: Number(opacityInput.value) / 100,
+        eraser: tool === 'eraser'
+      };
+
+      drawSegment(seg);
+      broadcast('stroke',{
+        ownerId:myId,
+        layerNo:activeLayer,
+        segment:seg
+      });
+      currentStrokeSegments.push(seg);
+    }
+
+    if(currentStrokeSegments.length){
+      const toSave = currentStrokeSegments.slice();
+      currentStrokeSegments = [];
+      await persistStroke(toSave);
+    }
+  }
+
+  drawing=false;
+  activePointerId=null;
+  panning=false;
+  panStart=null;
+  smoothPoint=null;
+  lastPoint=null;
+  canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
+});
 
 document.querySelectorAll('.tool').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('.tool').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     tool=btn.dataset.tool;
-    updateBrushCursorSize();
-    liveCtx.clearRect(0,0,WIDTH,HEIGHT);
   };
 });
 
@@ -1306,15 +1014,7 @@ document.querySelectorAll('.brush-type').forEach(btn=>{
   };
 });
 
-sizeInput.oninput=()=>{
-  sizeValue.textContent=sizeInput.value;
-  updateBrushCursorSize();
-};
-
-eraserSizeInput.oninput=()=>{
-  eraserSizeValue.textContent=eraserSizeInput.value;
-  updateBrushCursorSize();
-};
+sizeInput.oninput=()=>sizeValue.textContent=sizeInput.value;
 opacityInput.oninput=()=>opacityValue.textContent=opacityInput.value;
 smoothingInput.oninput=()=>smoothingValue.textContent=smoothingInput.value;
 colorInput.oninput=()=>hexValue.textContent=colorInput.value;
@@ -1375,24 +1075,18 @@ function isTypingTarget(target){
 
 function activateTool(nextTool){
   tool = nextTool;
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
   document.querySelectorAll('.tool').forEach(btn=>{
     btn.classList.toggle('active', btn.dataset.tool === nextTool);
   });
-  updateBrushCursorSize();
+  canvas.style.cursor = nextTool === 'hand' ? 'grab' : 'crosshair';
 }
 
 function changeBrushSize(delta){
-  const input = tool === 'eraser' ? eraserSizeInput : sizeInput;
-  const label = tool === 'eraser' ? eraserSizeValue : sizeValue;
-
-  const min = Number(input.min) || 1;
-  const max = Number(input.max) || 120;
-  const next = Math.max(min, Math.min(max, Number(input.value) + delta));
-
-  input.value = String(next);
-  label.textContent = String(next);
-  updateBrushCursorSize();
+  const min = Number(sizeInput.min) || 1;
+  const max = Number(sizeInput.max) || 80;
+  const next = Math.max(min, Math.min(max, Number(sizeInput.value) + delta));
+  sizeInput.value = String(next);
+  sizeValue.textContent = String(next);
 }
 
 window.addEventListener('keydown', async e=>{
@@ -1477,8 +1171,12 @@ setTimeout(()=>document.getElementById('zoomReset').click(),50);
 
 
 window.addEventListener('pointercancel', e=>{
-  finishStrokeImmediately(e.pointerId);
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+  if(e.pointerId !== activePointerId) return;
+  drawing = false;
+  activePointerId = null;
+  currentStrokeSegments = [];
+  smoothPoint = null;
+  lastPoint = null;
 });
 
 
@@ -1490,38 +1188,3 @@ window.addEventListener('pagehide', ()=>{
 window.addEventListener('beforeunload', ()=>{
   leaveRoomImmediately();
 });
-
-
-canvas.addEventListener('lostpointercapture', e=>{
-  finishStrokeImmediately(e.pointerId);
-});
-
-window.addEventListener('blur', ()=>{
-  // 창 포커스를 잃었을 때도 선이 붙잡힌 채 남지 않도록 종료
-  finishStrokeImmediately(activePointerId);
-});
-
-
-viewport.addEventListener('pointermove', e=>{
-  moveBrushCursor(e);
-});
-
-viewport.addEventListener('pointerenter', e=>{
-  moveBrushCursor(e);
-});
-
-viewport.addEventListener('pointerleave', ()=>{
-  hideBrushCursor();
-});
-
-canvas.addEventListener('pointerdown', e=>{
-  moveBrushCursor(e);
-});
-
-window.addEventListener('resize', ()=>{
-  updateBrushCursorSize();
-});
-
-sizeValue.textContent = sizeInput.value;
-eraserSizeValue.textContent = eraserSizeInput.value;
-updateBrushCursorSize();

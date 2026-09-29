@@ -19,6 +19,11 @@ const connectionLabel = document.getElementById('connectionLabel');
 const roomCodeLabel = document.getElementById('roomCode');
 const participantsEl = document.getElementById('participants');
 const participantCountEl = document.getElementById('participantCount');
+const layersEl = document.getElementById('layers');
+const addLayerBtn = document.getElementById('addLayerBtn');
+const chatMessagesEl = document.getElementById('chatMessages');
+const chatInput = document.getElementById('chatInput');
+const chatSendBtn = document.getElementById('chatSendBtn');
 
 const WIDTH = canvas.width, HEIGHT = canvas.height;
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
@@ -33,8 +38,16 @@ let panning = false;
 let panStart = null;
 let smoothPoint = null;
 let currentStrokeId = null;
+let currentStrokeSegments = [];
+let expiresAt = Date.now() + ROOM_LIFETIME_MS;
+let cachedRows = [];
 
-const myId = crypto.randomUUID();
+const USER_ID_KEY = 'haribo-sketch-user-id-v1';
+let myId = localStorage.getItem(USER_ID_KEY);
+if(!myId){
+  myId = crypto.randomUUID();
+  localStorage.setItem(USER_ID_KEY, myId);
+}
 const myName = 'guest-' + myId.slice(0,4);
 
 const params = new URLSearchParams(location.search);
@@ -46,12 +59,58 @@ if(!roomId){
 }
 roomCodeLabel.textContent = roomId;
 
-const expiryKey = `haribo-room-expiry-${roomId}`;
-let expiresAt = Number(localStorage.getItem(expiryKey));
-if(!expiresAt || expiresAt <= Date.now()){
-  expiresAt = Date.now() + ROOM_LIFETIME_MS;
-  localStorage.setItem(expiryKey, String(expiresAt));
+// ----- personal layers -----
+const layerCountKey = `haribo-layer-count-${roomId}`;
+const activeLayerKey = `haribo-active-layer-${roomId}`;
+let layerCount = Math.max(1, Math.min(3, Number(localStorage.getItem(layerCountKey) || 1)));
+let activeLayer = Math.max(1, Math.min(layerCount, Number(localStorage.getItem(activeLayerKey) || 1)));
+const hiddenLayers = new Set();
+
+function renderLayers(){
+  layersEl.innerHTML = '';
+
+  for(let n=1;n<=layerCount;n++){
+    const row = document.createElement('div');
+    row.className = 'layer-row';
+
+    const eye = document.createElement('button');
+    eye.className = 'layer-eye';
+    eye.textContent = hiddenLayers.has(n) ? '🙈' : '👁';
+    eye.title = hiddenLayers.has(n) ? '레이어 보이기' : '레이어 숨기기';
+    eye.onclick = async ()=>{
+      if(hiddenLayers.has(n)) hiddenLayers.delete(n);
+      else hiddenLayers.add(n);
+      renderLayers();
+      redrawFromCache();
+    };
+
+    const select = document.createElement('button');
+    select.className = 'layer-select' + (activeLayer===n ? ' active' : '');
+    select.textContent = `레이어 ${n}`;
+    select.onclick = ()=>{
+      activeLayer = n;
+      localStorage.setItem(activeLayerKey, String(activeLayer));
+      renderLayers();
+    };
+
+    row.appendChild(eye);
+    row.appendChild(select);
+    layersEl.appendChild(row);
+  }
+
+  addLayerBtn.disabled = layerCount >= 3;
+  addLayerBtn.textContent = layerCount >= 3 ? '최대 3개' : '＋ 레이어';
 }
+
+addLayerBtn.onclick = ()=>{
+  if(layerCount >= 3) return;
+  layerCount += 1;
+  activeLayer = layerCount;
+  localStorage.setItem(layerCountKey, String(layerCount));
+  localStorage.setItem(activeLayerKey, String(activeLayer));
+  renderLayers();
+};
+renderLayers();
 
 function clearCanvas(){
   ctx.save();
@@ -110,49 +169,210 @@ function drawSegment(seg){
   ctx.restore();
 }
 
+function rowVisible(row){
+  if(row.client_id === myId && hiddenLayers.has(Number(row.layer_no || 1))) return false;
+  return true;
+}
+
+function redrawFromCache(){
+  clearCanvas();
+
+  const ordered = cachedRows.slice().sort((a,b)=>{
+    const la = Number(a.layer_no || 1);
+    const lb = Number(b.layer_no || 1);
+    if(la !== lb) return la-lb;
+    return Number(a.id)-Number(b.id);
+  });
+
+  ordered.forEach(row=>{
+    if(!rowVisible(row)) return;
+    const payload = row.payload || {};
+    if(payload.type === 'stroke' && Array.isArray(payload.segments)){
+      payload.segments.forEach(drawSegment);
+    }
+  });
+}
+
 let channel = null;
 let supabaseClient = null;
 
 const cfg = window.HARIBO_CONFIG || {};
 const configured = cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY;
 
+async function ensureRoom(){
+  let { data: room, error } = await supabaseClient
+    .from('rooms')
+    .select('room_id, expires_at')
+    .eq('room_id', roomId)
+    .maybeSingle();
+
+  if(error) throw error;
+
+  const now = Date.now();
+
+  if(!room || new Date(room.expires_at).getTime() <= now){
+    if(room){
+      await supabaseClient.from('rooms').delete().eq('room_id', roomId);
+    }
+
+    const newExpiry = new Date(now + ROOM_LIFETIME_MS).toISOString();
+
+    const { error: upsertError } = await supabaseClient
+      .from('rooms')
+      .upsert(
+        { room_id: roomId, expires_at: newExpiry },
+        { onConflict:'room_id', ignoreDuplicates:true }
+      );
+
+    if(upsertError) throw upsertError;
+
+    const { data: freshRoom, error: freshError } = await supabaseClient
+      .from('rooms')
+      .select('room_id, expires_at')
+      .eq('room_id', roomId)
+      .single();
+
+    if(freshError) throw freshError;
+    room = freshRoom;
+  }
+
+  expiresAt = new Date(room.expires_at).getTime();
+}
+
+async function loadRoomHistory(){
+  const { data, error } = await supabaseClient
+    .from('strokes')
+    .select('id, client_id, layer_no, payload, created_at')
+    .eq('room_id', roomId)
+    .order('id', { ascending:true });
+
+  if(error) throw error;
+
+  cachedRows = data || [];
+  redrawFromCache();
+}
+
+async function loadChatHistory(){
+  const { data, error } = await supabaseClient
+    .from('chat_messages')
+    .select('id, client_id, nickname, message, created_at')
+    .eq('room_id', roomId)
+    .order('id', { ascending:true });
+
+  if(error) throw error;
+
+  renderChat(data || []);
+}
+
+async function persistStroke(segments){
+  if(!supabaseClient || !segments.length) return;
+
+  const { data, error } = await supabaseClient
+    .from('strokes')
+    .insert({
+      room_id: roomId,
+      client_id: myId,
+      layer_no: activeLayer,
+      payload: {
+        type:'stroke',
+        segments
+      }
+    })
+    .select('id, client_id, layer_no, payload, created_at')
+    .single();
+
+  if(!error && data){
+    cachedRows.push(data);
+  }
+}
+
+async function deleteMyDrawings(){
+  if(!supabaseClient) return;
+
+  const { error } = await supabaseClient
+    .from('strokes')
+    .delete()
+    .eq('room_id', roomId)
+    .eq('client_id', myId);
+
+  if(error){
+    console.error(error);
+    return;
+  }
+
+  await loadRoomHistory();
+  broadcast('owner_clear', { ownerId: myId });
+}
+
 async function setupRealtime(){
   if(!configured){
     connectionLabel.textContent = '로컬 미리보기';
     renderParticipants([{id:myId,name:myName}]);
+    renderChat([]);
     return;
   }
 
-  supabaseClient = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+  supabaseClient = window.supabase.createClient(
+    cfg.SUPABASE_URL,
+    cfg.SUPABASE_ANON_KEY
+  );
 
-  channel = supabaseClient.channel(`room:${roomId}`, {
-    config:{
-      broadcast:{self:false},
-      presence:{key:myId}
-    }
-  });
+  try{
+    connectionLabel.textContent = '그림 불러오는 중…';
 
-  channel
-    .on('broadcast',{event:'stroke'}, ({payload}) => drawSegment(payload))
-    .on('broadcast',{event:'clear'}, () => clearCanvas())
-    .on('broadcast',{event:'room_expired'}, () => {
-      clearCanvas();
-      startFreshTimer();
-    })
-    .on('presence',{event:'sync'}, () => {
-      const state = channel.presenceState();
-      const people = Object.values(state).flat();
-      renderParticipants(people);
+    await ensureRoom();
+    await Promise.all([loadRoomHistory(), loadChatHistory()]);
+
+    channel = supabaseClient.channel(`room:${roomId}`, {
+      config:{
+        broadcast:{self:false},
+        presence:{key:myId}
+      }
     });
 
-  await channel.subscribe(async status => {
-    if(status === 'SUBSCRIBED'){
-      connectionLabel.textContent = '실시간 연결됨';
-      await channel.track({id:myId,name:myName,joined_at:new Date().toISOString()});
-    } else {
-      connectionLabel.textContent = status.toLowerCase();
-    }
-  });
+    channel
+      .on('broadcast',{event:'stroke'}, ({payload}) => {
+        if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
+        drawSegment(payload.segment);
+      })
+      .on('broadcast',{event:'owner_clear'}, async () => {
+        await loadRoomHistory();
+      })
+      .on('broadcast',{event:'chat'}, ({payload}) => {
+        appendChat(payload);
+      })
+      .on('broadcast',{event:'room_expired'}, async ({payload}) => {
+        clearCanvas();
+        cachedRows = [];
+        renderChat([]);
+        if(payload?.expiresAt){
+          expiresAt = payload.expiresAt;
+        }else{
+          await ensureRoom();
+        }
+      })
+      .on('presence',{event:'sync'}, () => {
+        const state = channel.presenceState();
+        const people = Object.values(state).flat();
+        renderParticipants(people);
+      });
+
+    await channel.subscribe(async status => {
+      if(status === 'SUBSCRIBED'){
+        connectionLabel.textContent = '실시간 연결됨';
+        await channel.track({
+          id:myId,
+          name:myName,
+          joined_at:new Date().toISOString()
+        });
+      } else {
+        connectionLabel.textContent = status.toLowerCase();
+      }
+    });
+  }catch(err){
+    console.error(err);
+    connectionLabel.textContent = 'Supabase 설정 확인 필요';
+  }
 }
 
 function renderParticipants(list){
@@ -166,29 +386,136 @@ function renderParticipants(list){
   });
 }
 
+function renderChat(rows){
+  chatMessagesEl.innerHTML = '';
+  if(!rows.length){
+    const empty = document.createElement('div');
+    empty.className = 'chat-empty';
+    empty.textContent = '아직 메시지가 없어요 💬';
+    chatMessagesEl.appendChild(empty);
+    return;
+  }
+  rows.forEach(appendChat);
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+}
+
+function appendChat(row){
+  const existingEmpty = chatMessagesEl.querySelector('.chat-empty');
+  if(existingEmpty) existingEmpty.remove();
+
+  const div = document.createElement('div');
+  div.className = 'chat-msg' + (row.client_id === myId ? ' mine' : '');
+
+  const name = document.createElement('b');
+  name.textContent = row.nickname || 'guest';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = row.message || '';
+
+  div.appendChild(name);
+  div.appendChild(bubble);
+  chatMessagesEl.appendChild(div);
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+}
+
+async function sendChat(){
+  const message = chatInput.value.trim();
+  if(!message || !supabaseClient) return;
+
+  chatInput.value = '';
+
+  const { data, error } = await supabaseClient
+    .from('chat_messages')
+    .insert({
+      room_id: roomId,
+      client_id: myId,
+      nickname: myName,
+      message
+    })
+    .select('id, client_id, nickname, message, created_at')
+    .single();
+
+  if(error){
+    console.error(error);
+    return;
+  }
+
+  appendChat(data);
+  broadcast('chat', data);
+}
+
+chatSendBtn.onclick = sendChat;
+chatInput.addEventListener('keydown', e=>{
+  if(e.key === 'Enter'){
+    e.preventDefault();
+    sendChat();
+  }
+});
+
 function broadcast(event,payload={}){
   if(channel) channel.send({type:'broadcast',event,payload});
 }
 
-function startFreshTimer(){
-  expiresAt = Date.now() + ROOM_LIFETIME_MS;
-  localStorage.setItem(expiryKey,String(expiresAt));
+let resettingRoom = false;
+
+async function resetExpiredRoom(){
+  if(resettingRoom) return;
+  resettingRoom = true;
+
+  try{
+    clearCanvas();
+    cachedRows = [];
+    renderChat([]);
+
+    if(!supabaseClient){
+      expiresAt = Date.now() + ROOM_LIFETIME_MS;
+      return;
+    }
+
+    // rooms 삭제 -> strokes/chat_messages가 CASCADE로 같이 삭제됨
+    await supabaseClient.from('rooms').delete().eq('room_id', roomId);
+
+    const newExpiryIso = new Date(Date.now() + ROOM_LIFETIME_MS).toISOString();
+
+    await supabaseClient
+      .from('rooms')
+      .upsert(
+        { room_id:roomId, expires_at:newExpiryIso },
+        { onConflict:'room_id', ignoreDuplicates:true }
+      );
+
+    const { data: room } = await supabaseClient
+      .from('rooms')
+      .select('expires_at')
+      .eq('room_id',roomId)
+      .single();
+
+    expiresAt = new Date(room.expires_at).getTime();
+
+    broadcast('room_expired',{ expiresAt });
+  }finally{
+    resettingRoom = false;
+  }
 }
 
 function updateCountdown(){
   let remaining = expiresAt - Date.now();
+
   if(remaining <= 0){
-    clearCanvas();
-    broadcast('room_expired',{});
-    startFreshTimer();
-    remaining = ROOM_LIFETIME_MS;
+    expiryCountdown.textContent = '00:00';
+    resetExpiredRoom();
+    return;
   }
+
   const sec = Math.ceil(remaining/1000);
   const m = Math.floor(sec/60), s = sec%60;
-  expiryCountdown.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  expiryCountdown.textContent =
+    `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
 let lastPoint = null;
+
 canvas.addEventListener('pointerdown', e=>{
   if(spaceDown || tool==='hand'){
     panning = true;
@@ -196,9 +523,11 @@ canvas.addEventListener('pointerdown', e=>{
     canvas.style.cursor='grabbing';
     return;
   }
+
   drawing = true;
   smoothPoint = null;
   currentStrokeId = crypto.randomUUID();
+  currentStrokeSegments = [];
   lastPoint = smooth(canvasPointFromEvent(e));
   canvas.setPointerCapture?.(e.pointerId);
 });
@@ -210,23 +539,46 @@ canvas.addEventListener('pointermove', e=>{
     updateTransform();
     return;
   }
+
   if(!drawing) return;
+
   const p = smooth(canvasPointFromEvent(e));
+
   const seg = {
     strokeId:currentStrokeId,
-    x1:lastPoint.x,y1:lastPoint.y,x2:p.x,y2:p.y,
+    x1:lastPoint.x,
+    y1:lastPoint.y,
+    x2:p.x,
+    y2:p.y,
     width:getStyledWidth(p.pressure),
     color:colorInput.value,
     opacity:Number(opacityInput.value)/100,
     eraser:tool==='eraser'
   };
+
   drawSegment(seg);
-  broadcast('stroke',seg);
+
+  broadcast('stroke',{
+    ownerId:myId,
+    layerNo:activeLayer,
+    segment:seg
+  });
+
+  currentStrokeSegments.push(seg);
   lastPoint = p;
 });
 
-window.addEventListener('pointerup', ()=>{
-  drawing=false; panning=false; panStart=null; smoothPoint=null;
+window.addEventListener('pointerup', async ()=>{
+  if(drawing && currentStrokeSegments.length){
+    const toSave = currentStrokeSegments.slice();
+    currentStrokeSegments = [];
+    persistStroke(toSave);
+  }
+
+  drawing=false;
+  panning=false;
+  panStart=null;
+  smoothPoint=null;
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
 });
 
@@ -252,12 +604,14 @@ smoothingInput.oninput=()=>smoothingValue.textContent=smoothingInput.value;
 colorInput.oninput=()=>hexValue.textContent=colorInput.value;
 
 document.querySelectorAll('.swatches button').forEach(btn=>{
-  btn.onclick=()=>{colorInput.value=btn.dataset.color;hexValue.textContent=btn.dataset.color}
+  btn.onclick=()=>{
+    colorInput.value=btn.dataset.color;
+    hexValue.textContent=btn.dataset.color;
+  };
 });
 
-document.getElementById('clearBtn').onclick=()=>{
-  clearCanvas();
-  broadcast('clear',{});
+document.getElementById('clearBtn').onclick=async ()=>{
+  await deleteMyDrawings();
 };
 
 document.getElementById('saveBtn').onclick=()=>{
@@ -273,18 +627,41 @@ function copyRoom(){
 document.getElementById('copyRoomBtn').onclick=copyRoom;
 document.getElementById('copyRoomBtn2').onclick=copyRoom;
 
-document.getElementById('zoomIn').onclick=()=>{zoom=Math.min(2.5,zoom+.1);updateTransform()};
-document.getElementById('zoomOut').onclick=()=>{zoom=Math.max(.2,zoom-.1);updateTransform()};
+document.getElementById('zoomIn').onclick=()=>{
+  zoom=Math.min(2.5,zoom+.1);
+  updateTransform();
+};
+document.getElementById('zoomOut').onclick=()=>{
+  zoom=Math.max(.2,zoom-.1);
+  updateTransform();
+};
 document.getElementById('zoomReset').onclick=()=>{
-  zoom=Math.max(.2,Math.min(1.2,Math.min((viewport.clientWidth-40)/WIDTH,(viewport.clientHeight-40)/HEIGHT)));
-  pan={x:0,y:0};updateTransform();
+  zoom=Math.max(
+    .2,
+    Math.min(
+      1.2,
+      Math.min(
+        (viewport.clientWidth-40)/WIDTH,
+        (viewport.clientHeight-40)/HEIGHT
+      )
+    )
+  );
+  pan={x:0,y:0};
+  updateTransform();
 };
 
 window.addEventListener('keydown',e=>{
-  if(e.code==='Space'){e.preventDefault();spaceDown=true;canvas.style.cursor='grab'}
+  if(e.code==='Space'){
+    e.preventDefault();
+    spaceDown=true;
+    canvas.style.cursor='grab';
+  }
 });
 window.addEventListener('keyup',e=>{
-  if(e.code==='Space'){spaceDown=false;canvas.style.cursor=tool==='hand'?'grab':'crosshair'}
+  if(e.code==='Space'){
+    spaceDown=false;
+    canvas.style.cursor=tool==='hand'?'grab':'crosshair';
+  }
 });
 
 updateTransform();

@@ -83,9 +83,18 @@
         </section>
 
         <section>
+          <div class="section-title-row">
+            <h2>내 레이어</h2>
+            <button id="addLayerBtn" class="mini">＋ 레이어</button>
+          </div>
+          <div id="layers" class="layers"></div>
+          <p class="micro-copy">한 사람당 최대 3개까지 만들 수 있어요.</p>
+        </section>
+
+        <section>
           <h2>작업</h2>
           <div class="stack">
-            <button id="clearBtn" class="danger">전체 지우기</button>
+            <button id="clearBtn" class="danger">내 그림 지우기</button>
           </div>
         </section>
       </aside>
@@ -108,7 +117,7 @@
           </div>
         </div>
 
-        <div class="tip">💡 같은 방 링크를 열면 모두가 같은 그림을 봅니다. 8분이 끝나면 방 그림은 즉시 사라집니다.</div>
+        <div class="tip">💡 같은 방 링크를 열면 모두 같은 그림을 봅니다. 8분이 끝나면 그림과 채팅이 즉시 사라집니다.</div>
       </section>
 
       <aside class="panel right-panel">
@@ -127,11 +136,12 @@
           <div id="participants" class="participants"></div>
         </section>
 
-        <section>
-          <h2>주의</h2>
-          <div class="coming-soon">
-            지금 파일은 <b>Supabase Realtime</b>에 연결하면 진짜 다중접속으로 작동합니다.
-            설정값은 <code>config.js</code>에 넣으면 됩니다.
+        <section class="chat-section">
+          <h2>채팅</h2>
+          <div id="chatMessages" class="chat-messages"></div>
+          <div class="chat-compose">
+            <input id="chatInput" type="text" maxlength="200" placeholder="메시지 입력…" />
+            <button id="chatSendBtn" class="primary">전송</button>
           </div>
         </section>
       </aside>

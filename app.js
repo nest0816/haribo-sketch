@@ -52,12 +52,24 @@ const myName = 'guest-' + myId.slice(0,4);
 
 const params = new URLSearchParams(location.search);
 let roomId = params.get('room');
-if(!roomId){
-  roomId = Math.random().toString(36).slice(2,8);
-  params.set('room', roomId);
-  history.replaceState({}, '', `${location.pathname}?${params.toString()}`);
+const explicitRoom = Boolean(roomId);
+let roomMode = explicitRoom ? 'private' : 'public';
+
+const roomModeBadge = document.getElementById('roomModeBadge');
+const roomDescription = document.getElementById('roomDescription');
+const roomOccupancy = document.getElementById('roomOccupancy');
+
+function updateRoomLabels(){
+  roomCodeLabel.textContent = roomId || '찾는 중…';
+  if(roomMode === 'public'){
+    roomModeBadge.textContent = 'PUBLIC';
+    roomDescription.textContent = '최대 30명 공개방 · 꽉 차면 다음 방으로 자동 배정돼요.';
+  }else{
+    roomModeBadge.textContent = 'PRIVATE';
+    roomDescription.textContent = '이 링크를 공유하면 친구들이 같은 방으로 들어올 수 있어요.';
+  }
 }
-roomCodeLabel.textContent = roomId;
+updateRoomLabels();
 
 // ----- personal layers -----
 const layerCountKey = `haribo-layer-count-${roomId}`;
@@ -199,44 +211,90 @@ let supabaseClient = null;
 const cfg = window.HARIBO_CONFIG || {};
 const configured = cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY;
 
-async function ensureRoom(){
-  let { data: room, error } = await supabaseClient
-    .from('rooms')
-    .select('room_id, expires_at')
-    .eq('room_id', roomId)
-    .maybeSingle();
+function showStatus(message, isError=false){
+  if(!connectionLabel) return;
+  connectionLabel.textContent = message;
+  connectionLabel.style.color = isError ? '#c13b5b' : '';
+}
+
+
+
+const PUBLIC_ROOM_LIMIT = 30;
+let heartbeatTimer = null;
+
+async function assignPublicRoom(){
+  if(!supabaseClient) return;
+
+  const { data, error } = await supabaseClient.rpc('join_public_room', {
+    p_client_id: myId,
+    p_nickname: myName
+  });
 
   if(error) throw error;
 
-  const now = Date.now();
+  const assigned = Array.isArray(data) ? data[0] : data;
+  if(!assigned?.room_id) throw new Error('공개방 배정 실패');
 
-  if(!room || new Date(room.expires_at).getTime() <= now){
-    if(room){
-      await supabaseClient.from('rooms').delete().eq('room_id', roomId);
-    }
+  roomId = assigned.room_id;
+  roomMode = 'public';
+  expiresAt = new Date(assigned.expires_at).getTime();
 
-    const newExpiry = new Date(now + ROOM_LIFETIME_MS).toISOString();
+  params.set('room', roomId);
+  params.set('public', '1');
+  history.replaceState({}, '', `${location.pathname}?${params.toString()}`);
 
-    const { error: upsertError } = await supabaseClient
-      .from('rooms')
-      .upsert(
-        { room_id: roomId, expires_at: newExpiry },
-        { onConflict:'room_id', ignoreDuplicates:true }
-      );
+  updateRoomLabels();
+}
 
-    if(upsertError) throw upsertError;
+async function registerPrivateRoomMember(){
+  if(!supabaseClient || !roomId) return;
+  await supabaseClient.rpc('touch_room_member', {
+    p_room_id: roomId,
+    p_client_id: myId,
+    p_nickname: myName
+  });
+}
 
-    const { data: freshRoom, error: freshError } = await supabaseClient
-      .from('rooms')
-      .select('room_id, expires_at')
-      .eq('room_id', roomId)
-      .single();
+async function heartbeatRoomMember(){
+  if(!supabaseClient || !roomId) return;
+  await supabaseClient.rpc('touch_room_member', {
+    p_room_id: roomId,
+    p_client_id: myId,
+    p_nickname: myName
+  });
+}
 
-    if(freshError) throw freshError;
-    room = freshRoom;
+async function refreshOccupancy(){
+  if(!supabaseClient || !roomId) return;
+
+  const { data, error } = await supabaseClient.rpc('room_active_count', {
+    p_room_id: roomId
+  });
+
+  if(!error && roomOccupancy){
+    roomOccupancy.textContent = String(data ?? 1);
   }
+}
 
-  expiresAt = new Date(room.expires_at).getTime();
+function startHeartbeat(){
+  clearInterval(heartbeatTimer);
+  heartbeatRoomMember();
+  refreshOccupancy();
+
+  heartbeatTimer = setInterval(()=>{
+    heartbeatRoomMember();
+    refreshOccupancy();
+  }, 15000);
+}
+
+async function ensureRoom(){
+  const { data, error } = await supabaseClient.rpc('ensure_room', {
+    p_room_id: roomId,
+    p_room_type: roomMode === 'public' ? 'public' : 'private'
+  });
+
+  if(error) throw error;
+  expiresAt = new Date(data).getTime();
 }
 
 async function loadRoomHistory(){
@@ -267,82 +325,86 @@ async function loadChatHistory(){
 async function persistStroke(segments){
   if(!supabaseClient || !segments.length) return;
 
-  const { data, error } = await supabaseClient
-    .from('strokes')
-    .insert({
-      room_id: roomId,
-      client_id: myId,
-      layer_no: activeLayer,
-      payload: {
-        type:'stroke',
-        segments
-      }
-    })
-    .select('id, client_id, layer_no, payload, created_at')
-    .single();
+  const payload = {
+    type:'stroke',
+    segments
+  };
 
-  if(!error && data){
-    cachedRows.push(data);
+  const { data, error } = await supabaseClient.rpc('save_room_stroke', {
+    p_room_id: roomId,
+    p_client_id: myId,
+    p_layer_no: activeLayer,
+    p_payload: payload
+  });
+
+  if(error){
+    console.error('save_room_stroke failed', error);
+    showStatus('그림 저장 오류', true);
+    return;
   }
+
+  cachedRows.push({
+    id:Number(data),
+    room_id:roomId,
+    client_id:myId,
+    layer_no:activeLayer,
+    payload,
+    created_at:new Date().toISOString()
+  });
+
+  showStatus('실시간 연결됨');
 }
 
 async function deleteMyDrawings(){
   if(!supabaseClient) return;
 
-  const { error } = await supabaseClient
-    .from('strokes')
-    .delete()
-    .eq('room_id', roomId)
-    .eq('client_id', myId);
+  const { data, error } = await supabaseClient.rpc('clear_my_room_strokes', {
+    p_room_id: roomId,
+    p_client_id: myId
+  });
 
   if(error){
-    console.error(error);
+    console.error('clear_my_room_strokes failed', error);
+    showStatus('내 그림 지우기 오류', true);
     return;
   }
 
   await loadRoomHistory();
   broadcast('owner_clear', { ownerId: myId });
+  showStatus(`내 그림 삭제됨 (${Number(data || 0)}개)`);
+  setTimeout(()=>showStatus('실시간 연결됨'), 1200);
 }
 
 
 async function undoMyLastStroke(){
   if(!supabaseClient) return;
 
-  const { data, error } = await supabaseClient
-    .from('strokes')
-    .select('id')
-    .eq('room_id', roomId)
-    .eq('client_id', myId)
-    .order('id', { ascending:false })
-    .limit(1);
+  const { data, error } = await supabaseClient.rpc('undo_my_last_room_stroke', {
+    p_room_id: roomId,
+    p_client_id: myId
+  });
 
   if(error){
-    console.error(error);
+    console.error('undo_my_last_room_stroke failed', error);
+    showStatus('되돌리기 오류', true);
     return;
   }
 
-  if(!data || !data.length) return;
-
-  const lastId = data[0].id;
-
-  const { error: deleteError } = await supabaseClient
-    .from('strokes')
-    .delete()
-    .eq('id', lastId)
-    .eq('client_id', myId);
-
-  if(deleteError){
-    console.error(deleteError);
+  if(data === null){
+    showStatus('되돌릴 내 선이 없어요');
+    setTimeout(()=>showStatus('실시간 연결됨'), 1000);
     return;
   }
 
   await loadRoomHistory();
-  broadcast('owner_undo', { ownerId: myId, strokeId: lastId });
+  broadcast('owner_undo', { ownerId: myId, strokeId: Number(data) });
+  showStatus('마지막 선 되돌림');
+  setTimeout(()=>showStatus('실시간 연결됨'), 1000);
 }
 
 async function setupRealtime(){
   if(!configured){
-    connectionLabel.textContent = '로컬 미리보기';
+    showStatus('로컬 미리보기');
     renderParticipants([{id:myId,name:myName}]);
     renderChat([]);
     return;
@@ -354,9 +416,15 @@ async function setupRealtime(){
   );
 
   try{
-    connectionLabel.textContent = '그림 불러오는 중…';
+    showStatus('방 찾는 중…');
 
-    await ensureRoom();
+    if(!explicitRoom){
+      await assignPublicRoom();
+    }else{
+      await ensureRoom();
+      await registerPrivateRoomMember();
+    }
+
     await Promise.all([loadRoomHistory(), loadChatHistory()]);
 
     channel = supabaseClient.channel(`room:${roomId}`, {
@@ -394,23 +462,25 @@ async function setupRealtime(){
         const state = channel.presenceState();
         const people = Object.values(state).flat();
         renderParticipants(people);
+        if(roomOccupancy) roomOccupancy.textContent = String(people.length);
       });
 
     await channel.subscribe(async status => {
       if(status === 'SUBSCRIBED'){
-        connectionLabel.textContent = '실시간 연결됨';
+        showStatus('실시간 연결됨');
         await channel.track({
           id:myId,
           name:myName,
           joined_at:new Date().toISOString()
         });
+        startHeartbeat();
       } else {
-        connectionLabel.textContent = status.toLowerCase();
+        showStatus(status.toLowerCase());
       }
     });
   }catch(err){
     console.error(err);
-    connectionLabel.textContent = 'Supabase 설정 확인 필요';
+    showStatus('Supabase 설정 확인 필요', true);
   }
 }
 
@@ -462,26 +532,43 @@ async function sendChat(){
   const message = chatInput.value.trim();
   if(!message || !supabaseClient) return;
 
-  chatInput.value = '';
+  chatSendBtn.disabled = true;
 
-  const { data, error } = await supabaseClient
-    .from('chat_messages')
-    .insert({
-      room_id: roomId,
-      client_id: myId,
-      nickname: myName,
-      message
-    })
-    .select('id, client_id, nickname, message, created_at')
-    .single();
+  const { data, error } = await supabaseClient.rpc('send_room_chat', {
+    p_room_id: roomId,
+    p_client_id: myId,
+    p_nickname: myName,
+    p_message: message
+  });
+
+  chatSendBtn.disabled = false;
 
   if(error){
-    console.error(error);
+    console.error('send_room_chat failed', error);
+    showStatus('채팅 전송 오류', true);
+
+    // 채팅창에도 바로 오류를 보여줘 원인을 눈치챌 수 있게 함
+    const err = document.createElement('div');
+    err.className = 'chat-empty';
+    err.textContent = '메시지를 보내지 못했어요. Supabase SQL 설정을 확인해주세요.';
+    chatMessagesEl.appendChild(err);
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
     return;
   }
 
-  appendChat(data);
-  broadcast('chat', data);
+  chatInput.value = '';
+
+  const row = {
+    id:Number(data),
+    client_id:myId,
+    nickname:myName,
+    message,
+    created_at:new Date().toISOString()
+  };
+
+  appendChat(row);
+  broadcast('chat', row);
+  showStatus('실시간 연결됨');
 }
 
 chatSendBtn.onclick = sendChat;
@@ -512,26 +599,18 @@ async function resetExpiredRoom(){
       return;
     }
 
-    // rooms 삭제 -> strokes/chat_messages가 CASCADE로 같이 삭제됨
-    await supabaseClient.from('rooms').delete().eq('room_id', roomId);
+    const { data, error } = await supabaseClient.rpc('reset_room_8min', {
+      p_room_id: roomId,
+      p_room_type: roomMode === 'public' ? 'public' : 'private'
+    });
 
-    const newExpiryIso = new Date(Date.now() + ROOM_LIFETIME_MS).toISOString();
+    if(error){
+      console.error('reset_room_8min failed', error);
+      showStatus('방 초기화 오류', true);
+      return;
+    }
 
-    await supabaseClient
-      .from('rooms')
-      .upsert(
-        { room_id:roomId, expires_at:newExpiryIso },
-        { onConflict:'room_id', ignoreDuplicates:true }
-      );
-
-    const { data: room } = await supabaseClient
-      .from('rooms')
-      .select('expires_at')
-      .eq('room_id',roomId)
-      .single();
-
-    expiresAt = new Date(room.expires_at).getTime();
-
+    expiresAt = new Date(data).getTime();
     broadcast('room_expired',{ expiresAt });
   }finally{
     resettingRoom = false;
@@ -611,7 +690,7 @@ window.addEventListener('pointerup', async ()=>{
   if(drawing && currentStrokeSegments.length){
     const toSave = currentStrokeSegments.slice();
     currentStrokeSegments = [];
-    persistStroke(toSave);
+    await persistStroke(toSave);
   }
 
   drawing=false;

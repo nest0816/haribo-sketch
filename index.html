@@ -79,55 +79,62 @@
         </section>
 
         <section>
-          <h2>브러시</h2>
+          <h2 id="toolSettingsTitle">브러시</h2>
 
-          <label class="field">
-            <span>브러시 종류</span>
-            <div class="brush-type-row">
-              <button type="button" class="brush-type active" data-brush-type="fixed">
-                <b>일반</b><small>필압 없음</small>
-              </button>
-              <button type="button" class="brush-type" data-brush-type="pressure">
-                <b>필압</b><small>압력 반응</small>
-              </button>
-            </div>
-          </label>
+          <div id="brushOnlySettings">
+            <label class="field">
+              <span>브러시 종류</span>
+              <div class="brush-type-row">
+                <button type="button" class="brush-type active" data-brush-type="fixed">
+                  <b>일반</b><small>필압 없음</small>
+                </button>
+                <button type="button" class="brush-type" data-brush-type="pressure">
+                  <b>필압</b><small>압력 반응</small>
+                </button>
+              </div>
+            </label>
+          </div>
 
           <label class="field">
             <span>굵기 <b id="sizeValue">10</b>px</span>
             <input id="size" type="range" min="1" max="80" value="10" />
           </label>
 
-          <label class="field eraser-size-field">
-            <span>지우개 크기 <b id="eraserSizeValue">30</b>px</span>
-            <input id="eraserSize" type="range" min="2" max="120" value="30" />
-          </label>
+          <div class="size-presets" id="sizePresets">
+            <button type="button" data-size-preset="1"><span style="--s:1px"></span><b>1</b></button>
+            <button type="button" data-size-preset="5"><span style="--s:5px"></span><b>5</b></button>
+            <button type="button" data-size-preset="10"><span style="--s:10px"></span><b>10</b></button>
+            <button type="button" data-size-preset="15"><span style="--s:15px"></span><b>15</b></button>
+            <button type="button" data-size-preset="20"><span style="--s:20px"></span><b>20</b></button>
+          </div>
 
-          <label class="field">
-            <span>투명도 <b id="opacityValue">100</b>%</span>
-            <input id="opacity" type="range" min="5" max="100" value="100" />
-          </label>
+          <div id="brushExtraSettings">
+            <label class="field">
+              <span>투명도 <b id="opacityValue">100</b>%</span>
+              <input id="opacity" type="range" min="5" max="100" value="100" />
+            </label>
 
-          <label class="field">
-            <span>손떨림 보정 <b id="smoothingValue">0</b>%</span>
-            <input id="smoothing" type="range" min="0" max="95" value="0" />
-          </label>
+            <label class="field">
+              <span>손떨림 보정 <b id="smoothingValue">0</b>%</span>
+              <input id="smoothing" type="range" min="0" max="95" value="0" />
+            </label>
 
-          <label class="field">
-            <span>색상</span>
-            <div class="color-row">
-              <input id="color" type="color" value="#ff4fa3" />
-              <div id="hexValue">#ff4fa3</div>
+            <label class="field">
+              <span>색상</span>
+              <div class="color-row">
+                <input id="color" type="color" value="#ff4fa3" />
+                <div id="hexValue">#ff4fa3</div>
+              </div>
+            </label>
+
+            <div class="swatches">
+              <button data-color="#ff4fa3" style="--c:#ff4fa3"></button>
+              <button data-color="#8b5cf6" style="--c:#8b5cf6"></button>
+              <button data-color="#3b82f6" style="--c:#3b82f6"></button>
+              <button data-color="#14b8a6" style="--c:#14b8a6"></button>
+              <button data-color="#facc15" style="--c:#facc15"></button>
+              <button data-color="#111827" style="--c:#111827"></button>
             </div>
-          </label>
-
-          <div class="swatches">
-            <button data-color="#ff4fa3" style="--c:#ff4fa3"></button>
-            <button data-color="#8b5cf6" style="--c:#8b5cf6"></button>
-            <button data-color="#3b82f6" style="--c:#3b82f6"></button>
-            <button data-color="#14b8a6" style="--c:#14b8a6"></button>
-            <button data-color="#facc15" style="--c:#facc15"></button>
-            <button data-color="#111827" style="--c:#111827"></button>
           </div>
         </section>
 

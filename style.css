@@ -403,3 +403,52 @@ canvas{
     min-height:360px;
   }
 }
+
+
+/* v22 clean tool-size UI */
+.tool-settings-hidden{
+  display:none !important;
+}
+
+.size-presets{
+  display:grid;
+  grid-template-columns:repeat(5,1fr);
+  gap:6px;
+  margin:-3px 0 15px;
+}
+
+.size-presets button{
+  min-width:0;
+  padding:8px 4px 7px;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:end;
+  gap:5px;
+  border-radius:11px;
+}
+
+.size-presets button span{
+  width:max(4px,var(--s));
+  height:max(4px,var(--s));
+  max-width:22px;
+  max-height:22px;
+  border-radius:50%;
+  background:#25203a;
+  display:block;
+}
+
+.size-presets button b{
+  font-size:10px;
+  font-weight:600;
+  color:var(--muted);
+}
+
+.size-presets button.active{
+  background:#fff0f8;
+  border-color:#ffb8da;
+}
+
+.size-presets button.active b{
+  color:#d72b80;
+}

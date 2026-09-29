@@ -53,7 +53,7 @@ const myName = 'guest-' + myId.slice(0,4);
 const params = new URLSearchParams(location.search);
 let roomId = params.get('room');
 const explicitRoom = Boolean(roomId);
-let roomMode = explicitRoom ? 'private' : 'public';
+let roomMode = params.get('public') === '1' ? 'public' : (explicitRoom ? 'private' : 'public');
 
 const roomModeBadge = document.getElementById('roomModeBadge');
 const roomDescription = document.getElementById('roomDescription');
@@ -225,15 +225,24 @@ let heartbeatTimer = null;
 async function assignPublicRoom(){
   if(!supabaseClient) return;
 
-  const { data, error } = await supabaseClient.rpc('join_public_room', {
+  showStatus('공개방 찾는 중…');
+
+  const { data, error } = await supabaseClient.rpc('join_public_room_v2', {
     p_client_id: myId,
     p_nickname: myName
   });
 
-  if(error) throw error;
+  if(error){
+    console.error('join_public_room_v2 failed', error);
+    throw error;
+  }
 
-  const assigned = Array.isArray(data) ? data[0] : data;
-  if(!assigned?.room_id) throw new Error('공개방 배정 실패');
+  const assigned = typeof data === 'string' ? JSON.parse(data) : data;
+
+  if(!assigned || !assigned.room_id || !assigned.expires_at){
+    console.error('Bad room assignment payload:', assigned);
+    throw new Error('공개방 배정 결과가 올바르지 않습니다.');
+  }
 
   roomId = assigned.room_id;
   roomMode = 'public';
@@ -244,6 +253,7 @@ async function assignPublicRoom(){
   history.replaceState({}, '', `${location.pathname}?${params.toString()}`);
 
   updateRoomLabels();
+  showStatus('공개방 입장 완료');
 }
 
 async function registerPrivateRoomMember(){
@@ -423,6 +433,7 @@ async function setupRealtime(){
     }else{
       await ensureRoom();
       await registerPrivateRoomMember();
+      updateRoomLabels();
     }
 
     await Promise.all([loadRoomHistory(), loadChatHistory()]);
@@ -479,8 +490,8 @@ async function setupRealtime(){
       }
     });
   }catch(err){
-    console.error(err);
-    showStatus('Supabase 설정 확인 필요', true);
+    console.error('setupRealtime failed:', err);
+    showStatus('방 연결 오류 — 새로고침해주세요', true);
   }
 }
 

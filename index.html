@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Haribo Sketch Live ✨</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">✦</div>
+        <div>
+          <h1>Haribo Sketch Live</h1>
+          <p>8분 동안 모두가 같이 그리는 휘발성 그림방</p>
+        </div>
+      </div>
+
+      <div class="top-actions">
+        <button id="copyRoomBtn" class="ghost">🔗 방 링크 복사</button>
+        <button id="saveBtn" class="primary">PNG 저장</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="panel left-panel">
+        <section>
+          <h2>도구</h2>
+          <div class="tool-grid">
+            <button class="tool active" data-tool="brush">✏️<span>브러시</span></button>
+            <button class="tool" data-tool="eraser">🧽<span>지우개</span></button>
+            <button class="tool" data-tool="hand">🤚<span>이동</span></button>
+          </div>
+        </section>
+
+        <section>
+          <h2>브러시</h2>
+
+          <label class="field">
+            <span>브러시 종류</span>
+            <div class="brush-type-row">
+              <button type="button" class="brush-type active" data-brush-type="fixed">
+                <b>일반</b><small>필압 없음</small>
+              </button>
+              <button type="button" class="brush-type" data-brush-type="pressure">
+                <b>필압</b><small>압력 반응</small>
+              </button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>굵기 <b id="sizeValue">10</b>px</span>
+            <input id="size" type="range" min="1" max="80" value="10" />
+          </label>
+
+          <label class="field">
+            <span>투명도 <b id="opacityValue">100</b>%</span>
+            <input id="opacity" type="range" min="5" max="100" value="100" />
+          </label>
+
+          <label class="field">
+            <span>손떨림 보정 <b id="smoothingValue">55</b>%</span>
+            <input id="smoothing" type="range" min="0" max="95" value="55" />
+          </label>
+
+          <label class="field">
+            <span>색상</span>
+            <div class="color-row">
+              <input id="color" type="color" value="#ff4fa3" />
+              <div id="hexValue">#ff4fa3</div>
+            </div>
+          </label>
+
+          <div class="swatches">
+            <button data-color="#ff4fa3" style="--c:#ff4fa3"></button>
+            <button data-color="#8b5cf6" style="--c:#8b5cf6"></button>
+            <button data-color="#3b82f6" style="--c:#3b82f6"></button>
+            <button data-color="#14b8a6" style="--c:#14b8a6"></button>
+            <button data-color="#facc15" style="--c:#facc15"></button>
+            <button data-color="#111827" style="--c:#111827"></button>
+          </div>
+        </section>
+
+        <section>
+          <h2>작업</h2>
+          <div class="stack">
+            <button id="clearBtn" class="danger">전체 지우기</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="canvas-zone">
+        <div class="canvas-toolbar">
+          <div class="status"><span class="dot"></span> <span id="connectionLabel">연결 준비 중</span></div>
+          <div class="timer"><span>사라지기까지</span><b id="expiryCountdown">08:00</b></div>
+          <div class="zoom-controls">
+            <button id="zoomOut">−</button>
+            <span id="zoomLabel">100%</span>
+            <button id="zoomIn">＋</button>
+            <button id="zoomReset">맞춤</button>
+          </div>
+        </div>
+
+        <div id="viewport" class="viewport">
+          <div id="stage" class="stage">
+            <canvas id="canvas" width="1400" height="900"></canvas>
+          </div>
+        </div>
+
+        <div class="tip">💡 같은 방 링크를 열면 모두가 같은 그림을 봅니다. 8분이 끝나면 방 그림은 즉시 사라집니다.</div>
+      </section>
+
+      <aside class="panel right-panel">
+        <section>
+          <h2>룸</h2>
+          <div class="room-card">
+            <div class="room-badge">LIVE</div>
+            <strong id="roomCode">room</strong>
+            <p>이 링크를 공유하면 같은 그림방에 들어올 수 있어요.</p>
+            <button id="copyRoomBtn2">🔗 링크 복사</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>참여자 <span id="participantCount">1</span></h2>
+          <div id="participants" class="participants"></div>
+        </section>
+
+        <section>
+          <h2>주의</h2>
+          <div class="coming-soon">
+            지금 파일은 <b>Supabase Realtime</b>에 연결하면 진짜 다중접속으로 작동합니다.
+            설정값은 <code>config.js</code>에 넣으면 됩니다.
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

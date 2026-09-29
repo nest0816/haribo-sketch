@@ -46,6 +46,7 @@ let panStart = null;
 let smoothPoint = null;
 let currentStrokeId = null;
 let currentStrokeSegments = [];
+let activePointerId = null;
 let expiresAt = Date.now() + ROOM_LIFETIME_MS;
 let cachedRows = [];
 
@@ -818,7 +819,14 @@ function updateCountdown(){
 }
 
 
+
+function isInsideCanvasPoint(p){
+  return p.x >= 0 && p.x <= WIDTH && p.y >= 0 && p.y <= HEIGHT;
+}
+
 function emitDrawPoint(rawPoint){
+  if(!isInsideCanvasPoint(rawPoint)) return;
+
   const p = smooth(rawPoint);
 
   if(!lastPoint){
@@ -830,18 +838,27 @@ function emitDrawPoint(rawPoint){
   const dy = p.y - lastPoint.y;
   const distance = Math.hypot(dx, dy);
 
-  // 빠르게 그릴 때 pointermove 간격이 벌어져도 중간 점을 채워줌.
-  const step = Math.max(1.5, Math.min(6, Number(sizeInput.value) * 0.35));
+  // 비정상적으로 먼 좌표가 한 번 튀는 경우 연결하지 않음.
+  // 일반적인 빠른 드로잉은 유지하면서 순간 좌표 튐만 차단.
+  const jumpLimit = Math.max(140, Number(sizeInput.value) * 18);
+  if(distance > jumpLimit){
+    smoothPoint = {...rawPoint};
+    lastPoint = {...rawPoint};
+    return;
+  }
+
+  const step = Math.max(1.5, Math.min(5, Number(sizeInput.value) * 0.32));
   const pieces = Math.max(1, Math.ceil(distance / step));
 
-  let prev = lastPoint;
+  const start = {...lastPoint};
+  let prev = start;
 
   for(let i=1; i<=pieces; i++){
     const t = i / pieces;
     const q = {
-      x: lastPoint.x + dx * t,
-      y: lastPoint.y + dy * t,
-      pressure: lastPoint.pressure + (p.pressure - lastPoint.pressure) * t
+      x: start.x + dx * t,
+      y: start.y + dy * t,
+      pressure: start.pressure + (p.pressure - start.pressure) * t
     };
 
     const seg = {
@@ -881,12 +898,22 @@ canvas.addEventListener('pointerdown', e=>{
     return;
   }
 
+  // 이미 다른 포인터가 그리는 중이면 무시
+  if(activePointerId !== null) return;
+
+  activePointerId = e.pointerId;
   drawing = true;
   smoothPoint = null;
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
 
   const start = canvasPointFromEvent(e);
+  if(!isInsideCanvasPoint(start)){
+    drawing = false;
+    activePointerId = null;
+    return;
+  }
+
   smoothPoint = {...start};
   lastPoint = {...start};
 
@@ -901,49 +928,45 @@ canvas.addEventListener('pointermove', e=>{
     return;
   }
 
-  if(!drawing) return;
+  if(!drawing || e.pointerId !== activePointerId) return;
 
-  // 스타일러스/고주사율 마우스는 브라우저가 모아둔 중간 이벤트까지 사용.
   const events = typeof e.getCoalescedEvents === 'function'
     ? e.getCoalescedEvents()
     : [e];
 
   for(const ev of events){
-    emitDrawPoint(canvasPointFromEvent(ev));
+    if(ev.pointerId !== activePointerId) continue;
+    const p = canvasPointFromEvent(ev);
+    if(!isInsideCanvasPoint(p)) continue;
+    emitDrawPoint(p);
   }
 });
 
 window.addEventListener('pointerup', async e=>{
+  if(e.pointerId !== activePointerId){
+    panning=false;
+    panStart=null;
+    return;
+  }
+
   if(drawing){
-    // 보정 때문에 끝점이 덜 따라온 경우 실제 손을 뗀 위치까지 자연스럽게 마무리.
-    if(e && typeof e.clientX === 'number'){
-      const endRaw = canvasPointFromEvent(e);
-      const oldSmooth = smoothingInput.value;
+    // 손을 떼는 좌표까지 강제로 직선을 잇지 않음.
+    // pointermove에서 실제로 받은 좌표까지만 저장해 '선 튐' 방지.
 
-      // 마지막 한 번은 약한 보정으로 끝점까지 붙임
-      const savedPoint = smoothPoint;
-      smoothPoint = {
-        x: lastPoint?.x ?? endRaw.x,
-        y: lastPoint?.y ?? endRaw.y,
-        pressure: endRaw.pressure
-      };
-      emitDrawPoint(endRaw);
-    }
-
-    // 클릭/짧은 탭도 점으로 남게 함
+    // 탭만 한 경우 점 하나 생성
     if(currentStrokeSegments.length === 0 && lastPoint){
-      const r = Math.max(0.6, getStyledWidth(lastPoint.pressure) / 2);
       const seg = {
         strokeId: currentStrokeId,
         x1: lastPoint.x - 0.01,
         y1: lastPoint.y,
         x2: lastPoint.x + 0.01,
         y2: lastPoint.y,
-        width: r * 2,
+        width: getStyledWidth(lastPoint.pressure),
         color: colorInput.value,
         opacity: Number(opacityInput.value) / 100,
         eraser: tool === 'eraser'
       };
+
       drawSegment(seg);
       broadcast('stroke',{
         ownerId:myId,
@@ -961,6 +984,7 @@ window.addEventListener('pointerup', async e=>{
   }
 
   drawing=false;
+  activePointerId=null;
   panning=false;
   panStart=null;
   smoothPoint=null;
@@ -1138,3 +1162,13 @@ setupRealtime();
 updateCountdown();
 setInterval(updateCountdown,1000);
 setTimeout(()=>document.getElementById('zoomReset').click(),50);
+
+
+window.addEventListener('pointercancel', e=>{
+  if(e.pointerId !== activePointerId) return;
+  drawing = false;
+  activePointerId = null;
+  currentStrokeSegments = [];
+  smoothPoint = null;
+  lastPoint = null;
+});

@@ -59,11 +59,16 @@ let currentStrokeIsEraser = false;
 
 const remoteStrokeBuffers = new Map();
 
+const kickVoteCounts = new Map();
+const myKickVotes = new Set();
+let kickedFromRoom = false;
+
+
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
 
 let tool = 'brush';
 let brushSize = 10;
-let eraserSize = 20;
+let eraserSize = 30;
 let brushType = 'fixed';
 let drawing = false;
 let zoom = .72;
@@ -516,9 +521,12 @@ async function joinFixedPublicRoom(targetRoomId){
   const result = typeof data === 'string' ? JSON.parse(data) : data;
 
   if(!result?.ok){
-    lobbyMessage.textContent = result?.reason === 'full'
-      ? '이 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.'
-      : '지금은 입장할 수 없어요.';
+    lobbyMessage.textContent =
+      result?.reason === 'full'
+        ? '이 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.'
+        : result?.reason === 'banned'
+          ? '이 방에서 추방되어 이번 8분 동안 다시 들어갈 수 없어요.'
+          : '지금은 입장할 수 없어요.';
     lobbyMessage.classList.add('error');
     await fetchFixedRoomCounts();
     return false;
@@ -526,6 +534,8 @@ async function joinFixedPublicRoom(targetRoomId){
 
   roomId = targetRoomId;
   roomMode = 'public';
+  kickVoteCounts.clear();
+  myKickVotes.clear();
   expiresAt = new Date(result.expires_at).getTime();
 
   params.set('room', roomId);
@@ -583,6 +593,15 @@ async function registerPrivateRoomMember(){
 
 async function heartbeatRoomMember(){
   if(!supabaseClient || !roomId) return;
+
+  if(roomMode === 'public'){
+    const banned = await checkIfBannedFromRoom();
+    if(banned){
+      await handleKickedFromRoom();
+      return;
+    }
+  }
+
   await supabaseClient.rpc('touch_room_member', {
     p_room_id: roomId,
     p_client_id: myId,
@@ -834,6 +853,19 @@ async function connectRoomChannel(){
     .on('broadcast',{event:'chat'}, ({payload}) => {
       appendChat(payload);
     })
+    .on('broadcast',{event:'kick_vote'}, ({payload}) => {
+      if(!payload?.targetId) return;
+
+      kickVoteCounts.set(payload.targetId, Number(payload.voteCount || 0));
+
+      if(payload.kicked && payload.targetId === myId){
+        handleKickedFromRoom();
+        return;
+      }
+
+      const people = Object.values(channel.presenceState()).flat();
+      renderParticipants(people);
+    })
     .on('broadcast',{event:'room_expired'}, async ({payload}) => {
       clearCanvas();
       cachedRows = [];
@@ -910,6 +942,8 @@ async function returnToLobby(){
 
   roomId = null;
   roomMode = 'lobby';
+  kickVoteCounts.clear();
+  myKickVotes.clear();
 
   params.delete('room');
   params.delete('public');
@@ -930,6 +964,101 @@ brandHome?.addEventListener('keydown', e=>{
     returnToLobby();
   }
 });
+
+
+async function castKickVote(targetId, targetName, button){
+  if(!supabaseClient || !roomId || !targetId || targetId === myId) return;
+  if(myKickVotes.has(targetId)) return;
+
+  button.disabled = true;
+  button.textContent = '투표 중…';
+
+  const { data, error } = await supabaseClient.rpc('cast_room_kick_vote', {
+    p_room_id:roomId,
+    p_voter_id:myId,
+    p_target_id:targetId
+  });
+
+  if(error){
+    console.error('cast_room_kick_vote failed', error);
+    button.disabled = false;
+    button.textContent = '추방 투표';
+    showStatus('추방 투표 오류', true);
+    return;
+  }
+
+  const result = typeof data === 'string' ? JSON.parse(data) : data;
+
+  if(!result?.ok){
+    button.disabled = Boolean(result?.already_voted);
+    button.textContent = result?.already_voted ? '투표함' : '추방 투표';
+    return;
+  }
+
+  myKickVotes.add(targetId);
+  kickVoteCounts.set(targetId, Number(result.vote_count || 0));
+
+  broadcast('kick_vote',{
+    targetId,
+    targetName,
+    voteCount:Number(result.vote_count || 0),
+    kicked:Boolean(result.kicked)
+  });
+
+  renderParticipants(Object.values(channel?.presenceState?.() || {}).flat());
+
+  if(result.kicked){
+    showStatus(`${targetName}님이 추방되었습니다.`);
+    setTimeout(()=>showStatus('실시간 연결됨'),1200);
+  }
+}
+
+async function checkIfBannedFromRoom(){
+  if(!supabaseClient || !roomId || roomMode !== 'public') return false;
+
+  const { data, error } = await supabaseClient.rpc('is_room_member_banned', {
+    p_room_id:roomId,
+    p_client_id:myId
+  });
+
+  if(error){
+    console.warn('ban check failed', error);
+    return false;
+  }
+
+  return Boolean(data);
+}
+
+async function handleKickedFromRoom(){
+  if(kickedFromRoom) return;
+  kickedFromRoom = true;
+
+  showStatus('추방 투표 5표로 이 방에서 추방되었습니다.', true);
+
+  if(channel){
+    try{
+      await supabaseClient.removeChannel(channel);
+    }catch(e){}
+    channel = null;
+  }
+
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+
+  roomId = null;
+  roomMode = 'lobby';
+  params.delete('room');
+  params.delete('public');
+  history.replaceState({}, '', location.pathname);
+
+  updateRoomLabels();
+  showLobby();
+
+  lobbyMessage.textContent = '추방된 방에는 이번 8분 동안 다시 들어갈 수 없어요.';
+  lobbyMessage.classList.add('error');
+
+  kickedFromRoom = false;
+}
 
 async function setupRealtime(){
   if(!configured){
@@ -972,7 +1101,10 @@ async function setupRealtime(){
         history.replaceState({}, '', location.pathname);
         updateRoomLabels();
         showLobby();
-        lobbyMessage.textContent = '그 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.';
+        lobbyMessage.textContent =
+          result?.reason === 'banned'
+            ? '이 방에서 추방되어 이번 8분 동안 다시 들어갈 수 없어요.'
+            : '그 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.';
         lobbyMessage.classList.add('error');
         return;
       }
@@ -990,10 +1122,45 @@ async function setupRealtime(){
 function renderParticipants(list){
   participantCountEl.textContent = list.length;
   participantsEl.innerHTML = '';
-  list.slice(0,12).forEach(p=>{
+
+  list.slice(0,30).forEach(p=>{
     const div = document.createElement('div');
-    div.className='participant';
-    div.innerHTML = `<div class="avatar">${(p.name||'?').slice(-2)}</div><span>${p.name||'guest'}</span>`;
+    div.className='participant participant-with-action';
+    div.dataset.participantId = p.id || '';
+
+    const identity = document.createElement('div');
+    identity.className = 'participant-identity';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = (p.name||'?').slice(-2);
+
+    const name = document.createElement('span');
+    name.textContent = p.name || 'guest';
+
+    identity.appendChild(avatar);
+    identity.appendChild(name);
+    div.appendChild(identity);
+
+    if(p.id && p.id !== myId && roomMode === 'public'){
+      const action = document.createElement('button');
+      action.className = 'kick-vote-btn';
+
+      const count = kickVoteCounts.get(p.id) || 0;
+      const voted = myKickVotes.has(p.id);
+
+      action.textContent = voted
+        ? `투표함 ${count}/5`
+        : `추방 투표 ${count ? count + '/5' : ''}`;
+
+      action.disabled = voted;
+      action.addEventListener('click', ()=>{
+        castKickVote(p.id, p.name || 'guest', action);
+      });
+
+      div.appendChild(action);
+    }
+
     participantsEl.appendChild(div);
   });
 }
@@ -1359,6 +1526,36 @@ function currentToolSize(){
   return tool === 'eraser' ? eraserSize : brushSize;
 }
 
+function toolPresetValues(){
+  return tool === 'eraser'
+    ? [20,30,40,50,60]
+    : [1,5,10,15,20];
+}
+
+function renderSizePresets(){
+  const values = toolPresetValues();
+  const buttons = [...document.querySelectorAll('[data-size-preset]')];
+
+  buttons.forEach((btn,index)=>{
+    const value = values[index];
+    btn.dataset.sizePreset = String(value);
+
+    const dot = btn.querySelector('span');
+    const label = btn.querySelector('b');
+
+    if(dot){
+      const preview = tool === 'eraser'
+        ? Math.min(22, Math.max(7, value * .34))
+        : Math.min(22, Math.max(4, value));
+      dot.style.setProperty('--s', `${preview}px`);
+    }
+
+    if(label) label.textContent = String(value);
+  });
+
+  updateSizePresetActive();
+}
+
 function updateSizePresetActive(){
   document.querySelectorAll('[data-size-preset]').forEach(btn=>{
     btn.classList.toggle(
@@ -1380,7 +1577,7 @@ function syncToolSettingsUI(){
   sizeInput.value = String(value);
   sizeValue.textContent = String(value);
 
-  updateSizePresetActive();
+  renderSizePresets();
   updateBrushCursorSize();
 }
 

@@ -469,3 +469,46 @@ canvas{
   outline:2px solid #ff9cca;
   outline-offset:3px;
 }
+
+
+/* v23 vote-kick UI */
+.participant-with-action{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+}
+
+.participant-identity{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0;
+}
+
+.participant-identity span{
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.kick-vote-btn{
+  flex:0 0 auto;
+  padding:6px 8px;
+  font-size:10px;
+  border-radius:9px;
+  color:#a64a62;
+  background:#fff5f7;
+  border-color:#ffd2dc;
+}
+
+.kick-vote-btn:hover{
+  background:#ffecef;
+}
+
+.kick-vote-btn:disabled{
+  opacity:.58;
+  cursor:default;
+  transform:none;
+  box-shadow:none;
+}

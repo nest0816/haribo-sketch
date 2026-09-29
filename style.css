@@ -228,3 +228,31 @@ input[type="range"]{width:100%;accent-color:var(--pink)}.color-row{display:flex;
 @media(max-width:760px){
   .chat-messages{height:320px;min-height:320px;}
 }
+
+
+/* v18 dynamic round brush cursor */
+canvas{
+  cursor:none !important;
+}
+.brush-cursor{
+  position:absolute;
+  left:0;
+  top:0;
+  width:10px;
+  height:10px;
+  border:1.5px solid rgba(37,32,58,.82);
+  border-radius:50%;
+  pointer-events:none;
+  transform:translate(-50%,-50%);
+  z-index:20;
+  display:none;
+  box-sizing:border-box;
+  background:transparent;
+  box-shadow:0 0 0 1px rgba(255,255,255,.55);
+}
+.brush-cursor.eraser{
+  border-style:dashed;
+}
+.brush-cursor.hand{
+  display:none !important;
+}

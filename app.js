@@ -24,6 +24,7 @@ const addLayerBtn = document.getElementById('addLayerBtn');
 const chatMessagesEl = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const chatSendBtn = document.getElementById('chatSendBtn');
+const brushCursor = document.getElementById('brushCursor');
 
 const lobbyOverlay = document.getElementById('lobbyOverlay');
 const lobbyNickname = document.getElementById('lobbyNickname');
@@ -165,9 +166,58 @@ function clearCanvas(){
 }
 clearCanvas();
 
+
+function updateBrushCursorSize(){
+  if(!brushCursor) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width / WIDTH;
+  const scaleY = rect.height / HEIGHT;
+  const scale = (scaleX + scaleY) / 2;
+
+  const px = Math.max(4, Number(sizeInput.value) * scale);
+  brushCursor.style.width = `${px}px`;
+  brushCursor.style.height = `${px}px`;
+
+  brushCursor.classList.toggle('eraser', tool === 'eraser');
+  brushCursor.classList.toggle('hand', tool === 'hand');
+}
+
+function moveBrushCursor(e){
+  if(!brushCursor) return;
+  if(tool === 'hand'){
+    brushCursor.style.display = 'none';
+    return;
+  }
+
+  const viewportRect = viewport.getBoundingClientRect();
+  const canvasRect = canvas.getBoundingClientRect();
+
+  const insideCanvas =
+    e.clientX >= canvasRect.left &&
+    e.clientX <= canvasRect.right &&
+    e.clientY >= canvasRect.top &&
+    e.clientY <= canvasRect.bottom;
+
+  if(!insideCanvas){
+    brushCursor.style.display = 'none';
+    return;
+  }
+
+  brushCursor.style.display = 'block';
+  brushCursor.style.left = `${e.clientX - viewportRect.left}px`;
+  brushCursor.style.top = `${e.clientY - viewportRect.top}px`;
+  updateBrushCursorSize();
+}
+
+function hideBrushCursor(){
+  if(brushCursor) brushCursor.style.display = 'none';
+}
+
 function updateTransform(){
   stage.style.transform = `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${zoom})`;
   zoomLabel.textContent = `${Math.round(zoom*100)}%`;
+  updateBrushCursorSize();
 }
 
 function canvasPointFromEvent(e){
@@ -1072,6 +1122,7 @@ document.querySelectorAll('.tool').forEach(btn=>{
     document.querySelectorAll('.tool').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     tool=btn.dataset.tool;
+    updateBrushCursorSize();
   };
 });
 
@@ -1083,7 +1134,10 @@ document.querySelectorAll('.brush-type').forEach(btn=>{
   };
 });
 
-sizeInput.oninput=()=>sizeValue.textContent=sizeInput.value;
+sizeInput.oninput=()=>{
+  sizeValue.textContent=sizeInput.value;
+  updateBrushCursorSize();
+};
 opacityInput.oninput=()=>opacityValue.textContent=opacityInput.value;
 smoothingInput.oninput=()=>smoothingValue.textContent=smoothingInput.value;
 colorInput.oninput=()=>hexValue.textContent=colorInput.value;
@@ -1147,7 +1201,7 @@ function activateTool(nextTool){
   document.querySelectorAll('.tool').forEach(btn=>{
     btn.classList.toggle('active', btn.dataset.tool === nextTool);
   });
-  canvas.style.cursor = nextTool === 'hand' ? 'grab' : 'crosshair';
+  updateBrushCursorSize();
 }
 
 function changeBrushSize(delta){
@@ -1156,6 +1210,7 @@ function changeBrushSize(delta){
   const next = Math.max(min, Math.min(max, Number(sizeInput.value) + delta));
   sizeInput.value = String(next);
   sizeValue.textContent = String(next);
+  updateBrushCursorSize();
 }
 
 window.addEventListener('keydown', async e=>{
@@ -1261,4 +1316,25 @@ canvas.addEventListener('lostpointercapture', e=>{
 window.addEventListener('blur', ()=>{
   // 창 포커스를 잃었을 때도 선이 붙잡힌 채 남지 않도록 종료
   finishStrokeImmediately(activePointerId);
+});
+
+
+viewport.addEventListener('pointermove', e=>{
+  moveBrushCursor(e);
+});
+
+viewport.addEventListener('pointerenter', e=>{
+  moveBrushCursor(e);
+});
+
+viewport.addEventListener('pointerleave', ()=>{
+  hideBrushCursor();
+});
+
+canvas.addEventListener('pointerdown', e=>{
+  moveBrushCursor(e);
+});
+
+window.addEventListener('resize', ()=>{
+  updateBrushCursorSize();
 });

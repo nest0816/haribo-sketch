@@ -304,6 +304,42 @@ async function deleteMyDrawings(){
   broadcast('owner_clear', { ownerId: myId });
 }
 
+
+async function undoMyLastStroke(){
+  if(!supabaseClient) return;
+
+  const { data, error } = await supabaseClient
+    .from('strokes')
+    .select('id')
+    .eq('room_id', roomId)
+    .eq('client_id', myId)
+    .order('id', { ascending:false })
+    .limit(1);
+
+  if(error){
+    console.error(error);
+    return;
+  }
+
+  if(!data || !data.length) return;
+
+  const lastId = data[0].id;
+
+  const { error: deleteError } = await supabaseClient
+    .from('strokes')
+    .delete()
+    .eq('id', lastId)
+    .eq('client_id', myId);
+
+  if(deleteError){
+    console.error(deleteError);
+    return;
+  }
+
+  await loadRoomHistory();
+  broadcast('owner_undo', { ownerId: myId, strokeId: lastId });
+}
+
 async function setupRealtime(){
   if(!configured){
     connectionLabel.textContent = '로컬 미리보기';
@@ -336,6 +372,9 @@ async function setupRealtime(){
         drawSegment(payload.segment);
       })
       .on('broadcast',{event:'owner_clear'}, async () => {
+        await loadRoomHistory();
+      })
+      .on('broadcast',{event:'owner_undo'}, async () => {
         await loadRoomHistory();
       })
       .on('broadcast',{event:'chat'}, ({payload}) => {
@@ -650,19 +689,102 @@ document.getElementById('zoomReset').onclick=()=>{
   updateTransform();
 };
 
-window.addEventListener('keydown',e=>{
-  if(e.code==='Space'){
+
+function isTypingTarget(target){
+  if(!target) return false;
+  const tag = target.tagName?.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || target.isContentEditable;
+}
+
+function activateTool(nextTool){
+  tool = nextTool;
+  document.querySelectorAll('.tool').forEach(btn=>{
+    btn.classList.toggle('active', btn.dataset.tool === nextTool);
+  });
+  canvas.style.cursor = nextTool === 'hand' ? 'grab' : 'crosshair';
+}
+
+function changeBrushSize(delta){
+  const min = Number(sizeInput.min) || 1;
+  const max = Number(sizeInput.max) || 80;
+  const next = Math.max(min, Math.min(max, Number(sizeInput.value) + delta));
+  sizeInput.value = String(next);
+  sizeValue.textContent = String(next);
+}
+
+window.addEventListener('keydown', async e=>{
+  const typing = isTypingTarget(e.target);
+
+  if(e.code === 'Space' && !typing){
     e.preventDefault();
-    spaceDown=true;
-    canvas.style.cursor='grab';
+    spaceDown = true;
+    canvas.style.cursor = 'grab';
+    return;
+  }
+
+  if(typing) return;
+
+  // Ctrl/Cmd + Z : 내 마지막 스트로크만 되돌리기
+  if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'){
+    e.preventDefault();
+    await undoMyLastStroke();
+    return;
+  }
+
+  if(e.key.toLowerCase() === 'e'){
+    e.preventDefault();
+    activateTool('eraser');
+    return;
+  }
+
+  if(e.key.toLowerCase() === 'b'){
+    e.preventDefault();
+    activateTool('brush');
+    return;
+  }
+
+  if(e.key === '['){
+    e.preventDefault();
+    changeBrushSize(-2);
+    return;
+  }
+
+  if(e.key === ']'){
+    e.preventDefault();
+    changeBrushSize(2);
+    return;
   }
 });
+
 window.addEventListener('keyup',e=>{
   if(e.code==='Space'){
     spaceDown=false;
     canvas.style.cursor=tool==='hand'?'grab':'crosshair';
   }
 });
+
+// 마우스 휠 확대/축소
+viewport.addEventListener('wheel', e=>{
+  // 채팅/입력 영역 스크롤에는 개입하지 않음
+  if(isTypingTarget(e.target)) return;
+
+  e.preventDefault();
+
+  const rect = viewport.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left - rect.width / 2;
+  const mouseY = e.clientY - rect.top - rect.height / 2;
+
+  const oldZoom = zoom;
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  zoom = Math.max(.2, Math.min(2.5, zoom * factor));
+
+  // 마우스 포인터가 가리키던 캔버스 위치가 크게 튀지 않도록 팬 보정
+  const scaleRatio = zoom / oldZoom;
+  pan.x = mouseX - (mouseX - pan.x) * scaleRatio;
+  pan.y = mouseY - (mouseY - pan.y) * scaleRatio;
+
+  updateTransform();
+}, { passive:false });
 
 updateTransform();
 setupRealtime();

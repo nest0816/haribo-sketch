@@ -3,6 +3,13 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const liveCanvas = document.getElementById('liveCanvas');
 const liveCtx = liveCanvas.getContext('2d');
+
+const remoteCanvas = document.createElement('canvas');
+remoteCanvas.width = canvas.width;
+remoteCanvas.height = canvas.height;
+remoteCanvas.className = 'remote-live-canvas';
+canvas.parentElement.appendChild(remoteCanvas);
+const remoteCtx = remoteCanvas.getContext('2d');
 const viewport = document.getElementById('viewport');
 const stage = document.getElementById('stage');
 
@@ -46,6 +53,9 @@ const strokeBufferCtx = strokeBuffer.getContext('2d');
 
 let currentStrokeOpacity = 1;
 let currentStrokeIsEraser = false;
+
+const remoteStrokeBuffers = new Map();
+
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
 
 let tool = 'brush';
@@ -169,6 +179,10 @@ addLayerBtn.onclick = ()=>{
 renderLayers();
 
 function clearCanvas(){
+  remoteStrokeBuffers.clear();
+  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -320,6 +334,74 @@ function drawStrokeSegments(targetCtx, segments){
 
 function drawSegment(seg){
   drawStrokeSegments(ctx,[seg]);
+}
+
+
+function redrawRemoteStrokes(){
+  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
+
+  for(const stroke of remoteStrokeBuffers.values()){
+    if(!stroke.segments.length) continue;
+
+    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
+
+    stroke.segments.forEach(seg=>{
+      drawOpaqueSegment(strokeBufferCtx, seg);
+    });
+
+    remoteCtx.save();
+    remoteCtx.globalAlpha = stroke.eraser ? 1 : stroke.opacity;
+    remoteCtx.globalCompositeOperation = 'source-over';
+    remoteCtx.drawImage(strokeBuffer,0,0);
+    remoteCtx.restore();
+
+    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
+  }
+}
+
+function receiveRemoteStrokeBatch(payload){
+  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+  if(!segments.length) return;
+
+  const strokeId = segments[0]?.strokeId || payload.strokeId;
+  if(!strokeId) return;
+
+  let stroke = remoteStrokeBuffers.get(strokeId);
+
+  if(!stroke){
+    const first = segments[0];
+    stroke = {
+      ownerId:payload.ownerId,
+      layerNo:Number(payload.layerNo || 1),
+      opacity:Number(first.opacity ?? 1),
+      eraser:Boolean(first.eraser),
+      segments:[]
+    };
+    remoteStrokeBuffers.set(strokeId, stroke);
+  }
+
+  stroke.segments.push(...segments);
+  redrawRemoteStrokes();
+}
+
+function finishRemoteStroke(payload){
+  const strokeId = payload?.strokeId;
+  if(!strokeId) return;
+
+  const stroke = remoteStrokeBuffers.get(strokeId);
+
+  // stroke_end에는 전체 획도 같이 보내므로,
+  // 중간 broadcast가 일부 유실되어도 최종 모양은 정확하게 복구.
+  const fullSegments = Array.isArray(payload?.segments) && payload.segments.length
+    ? payload.segments
+    : stroke?.segments;
+
+  if(fullSegments?.length){
+    drawStrokeSegments(ctx, fullSegments);
+  }
+
+  remoteStrokeBuffers.delete(strokeId);
+  redrawRemoteStrokes();
 }
 
 function redrawLiveStroke(){
@@ -725,13 +807,22 @@ async function connectRoomChannel(){
   channel
     .on('broadcast',{event:'stroke'}, ({payload}) => {
       // 이전 버전 클라이언트 호환
-      if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
-      if(payload.segment) drawSegment(payload.segment);
+      if(payload.ownerId === myId) return;
+      if(payload.segment){
+        receiveRemoteStrokeBatch({
+          ownerId:payload.ownerId,
+          layerNo:payload.layerNo,
+          segments:[payload.segment]
+        });
+      }
     })
     .on('broadcast',{event:'stroke_batch'}, ({payload}) => {
-      if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
-      const segments = Array.isArray(payload.segments) ? payload.segments : [];
-      drawStrokeSegments(ctx, segments);
+      if(payload.ownerId === myId) return;
+      receiveRemoteStrokeBatch(payload);
+    })
+    .on('broadcast',{event:'stroke_end'}, ({payload}) => {
+      if(payload.ownerId === myId) return;
+      finishRemoteStroke(payload);
     })
     .on('broadcast',{event:'owner_clear'}, async () => {
       await loadRoomHistory();
@@ -1159,6 +1250,15 @@ function finishStrokeImmediately(pointerId){
     ctx.globalCompositeOperation = 'source-over';
     ctx.drawImage(liveCanvas,0,0);
     ctx.restore();
+  }
+
+  if(segmentsToSave.length){
+    broadcast('stroke_end',{
+      ownerId:myId,
+      layerNo:activeLayer,
+      strokeId:segmentsToSave[0]?.strokeId,
+      segments:segmentsToSave
+    });
   }
 
   liveCtx.clearRect(0,0,WIDTH,HEIGHT);

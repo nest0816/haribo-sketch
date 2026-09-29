@@ -1,15 +1,19 @@
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const liveCanvas = document.getElementById('liveCanvas');
+const liveCtx = liveCanvas.getContext('2d');
 const viewport = document.getElementById('viewport');
 const stage = document.getElementById('stage');
 
 const colorInput = document.getElementById('color');
 const sizeInput = document.getElementById('size');
+const eraserSizeInput = document.getElementById('eraserSize');
 const opacityInput = document.getElementById('opacity');
 const smoothingInput = document.getElementById('smoothing');
 
 const sizeValue = document.getElementById('sizeValue');
+const eraserSizeValue = document.getElementById('eraserSizeValue');
 const opacityValue = document.getElementById('opacityValue');
 const smoothingValue = document.getElementById('smoothingValue');
 const hexValue = document.getElementById('hexValue');
@@ -34,6 +38,14 @@ const myNicknameEl = document.getElementById('myNickname');
 
 
 const WIDTH = canvas.width, HEIGHT = canvas.height;
+
+const strokeBuffer = document.createElement('canvas');
+strokeBuffer.width = WIDTH;
+strokeBuffer.height = HEIGHT;
+const strokeBufferCtx = strokeBuffer.getContext('2d');
+
+let currentStrokeOpacity = 1;
+let currentStrokeIsEraser = false;
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
 
 let tool = 'brush';
@@ -175,7 +187,10 @@ function updateBrushCursorSize(){
   const scaleY = rect.height / HEIGHT;
   const scale = (scaleX + scaleY) / 2;
 
-  const px = Math.max(4, Number(sizeInput.value) * scale);
+  const logicalSize = tool === 'eraser'
+    ? Number(eraserSizeInput.value)
+    : Number(sizeInput.value);
+  const px = Math.max(4, logicalSize * scale);
   brushCursor.style.width = `${px}px`;
   brushCursor.style.height = `${px}px`;
 
@@ -230,8 +245,14 @@ function canvasPointFromEvent(e){
 }
 
 function getStyledWidth(pressure){
-  const base = Number(sizeInput.value);
-  if(brushType === 'pressure') return Math.max(1, base * (.25 + pressure * 1.1));
+  const base = tool === 'eraser'
+    ? Number(eraserSizeInput.value)
+    : Number(sizeInput.value);
+
+  if(tool !== 'eraser' && brushType === 'pressure'){
+    return Math.max(1, base * (.25 + pressure * 1.1));
+  }
+
   return base;
 }
 
@@ -260,22 +281,58 @@ function smooth(raw){
   return {...smoothPoint};
 }
 
+function drawOpaqueSegment(targetCtx, seg){
+  targetCtx.save();
+  targetCtx.globalCompositeOperation = 'source-over';
+  targetCtx.globalAlpha = 1;
+  targetCtx.strokeStyle = seg.eraser ? '#ffffff' : seg.color;
+  targetCtx.lineCap = 'round';
+  targetCtx.lineJoin = 'round';
+  targetCtx.beginPath();
+  targetCtx.moveTo(seg.x1,seg.y1);
+  targetCtx.lineTo(seg.x2,seg.y2);
+  targetCtx.lineWidth = seg.width;
+  targetCtx.stroke();
+  targetCtx.restore();
+}
+
+function drawStrokeSegments(targetCtx, segments){
+  if(!segments || !segments.length) return;
+
+  strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
+
+  // 한 획 전체를 먼저 100% 불투명으로 만든다.
+  segments.forEach(seg=>{
+    drawOpaqueSegment(strokeBufferCtx, seg);
+  });
+
+  const first = segments[0];
+  const alpha = first.eraser ? 1 : Number(first.opacity ?? 1);
+
+  targetCtx.save();
+  targetCtx.globalAlpha = alpha;
+  targetCtx.globalCompositeOperation = 'source-over';
+  targetCtx.drawImage(strokeBuffer,0,0);
+  targetCtx.restore();
+
+  strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
+}
+
 function drawSegment(seg){
-  ctx.save();
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.globalAlpha = seg.opacity;
-  ctx.strokeStyle = seg.eraser ? '#fff' : seg.color;
+  drawStrokeSegments(ctx,[seg]);
+}
 
-  // 반투명 선에서 각 조각의 둥근 끝이 겹치며 생기는 '점점점' 현상 방지
-  ctx.lineCap = seg.opacity < 0.999 ? 'butt' : 'round';
-  ctx.lineJoin = 'round';
+function redrawLiveStroke(){
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+  if(!currentStrokeSegments.length) return;
 
-  ctx.beginPath();
-  ctx.moveTo(seg.x1,seg.y1);
-  ctx.lineTo(seg.x2,seg.y2);
-  ctx.lineWidth = seg.width;
-  ctx.stroke();
-  ctx.restore();
+  // liveCanvas 자체는 불투명한 한 획.
+  // 투명도는 CSS가 아니라 병합할 때 한 번만 적용한다.
+  currentStrokeSegments.forEach(seg=>{
+    drawOpaqueSegment(liveCtx, seg);
+  });
+
+  liveCanvas.style.opacity = String(currentStrokeIsEraser ? 1 : currentStrokeOpacity);
 }
 
 function rowVisible(row){
@@ -297,7 +354,7 @@ function redrawFromCache(){
     if(!rowVisible(row)) return;
     const payload = row.payload || {};
     if(payload.type === 'stroke' && Array.isArray(payload.segments)){
-      payload.segments.forEach(drawSegment);
+      drawStrokeSegments(ctx, payload.segments);
     }
   });
 }
@@ -674,7 +731,7 @@ async function connectRoomChannel(){
     .on('broadcast',{event:'stroke_batch'}, ({payload}) => {
       if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
       const segments = Array.isArray(payload.segments) ? payload.segments : [];
-      segments.forEach(drawSegment);
+      drawStrokeSegments(ctx, segments);
     })
     .on('broadcast',{event:'owner_clear'}, async () => {
       await loadRoomHistory();
@@ -999,10 +1056,10 @@ function emitDrawPoint(rawPoint){
     eraser:tool==='eraser'
   };
 
-  // 로컬 표시 최우선
-  drawSegment(seg);
-
+  // 로컬 한 획은 liveCanvas에서 다시 그린다.
+  // 반투명 조각들이 서로 겹치지 않도록 전체 획을 한 번에 표시.
   currentStrokeSegments.push(seg);
+  redrawLiveStroke();
   queueNetworkSegment(seg);
 
   lastPoint = p;
@@ -1033,6 +1090,10 @@ canvas.addEventListener('pointerdown', e=>{
   }
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
+  currentStrokeOpacity = tool === 'eraser' ? 1 : Number(opacityInput.value)/100;
+  currentStrokeIsEraser = tool === 'eraser';
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+  liveCanvas.style.opacity = String(currentStrokeOpacity);
 
   const start = canvasPointFromEvent(e);
   if(!isInsideCanvasPoint(start)){
@@ -1089,8 +1150,19 @@ function finishStrokeImmediately(pointerId){
   if(activePointerId === null) return;
   if(pointerId !== undefined && pointerId !== null && pointerId !== activePointerId) return;
 
-  // 중요: 서버 저장보다 먼저 로컬 드로잉 상태를 즉시 종료한다.
   const segmentsToSave = currentStrokeSegments.slice();
+
+  // 손을 떼는 순간 현재 live 획을 메인 캔버스에 단 한 번 합성.
+  if(segmentsToSave.length){
+    ctx.save();
+    ctx.globalAlpha = currentStrokeIsEraser ? 1 : currentStrokeOpacity;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(liveCanvas,0,0);
+    ctx.restore();
+  }
+
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+  liveCanvas.style.opacity = '1';
 
   drawing = false;
   activePointerId = null;
@@ -1106,7 +1178,6 @@ function finishStrokeImmediately(pointerId){
 
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
 
-  // 저장은 뒤에서 진행. 저장 중에도 절대 다시 선이 이어지지 않는다.
   if(segmentsToSave.length){
     saveFinishedStroke(segmentsToSave);
   }
@@ -1123,6 +1194,7 @@ document.querySelectorAll('.tool').forEach(btn=>{
     btn.classList.add('active');
     tool=btn.dataset.tool;
     updateBrushCursorSize();
+    liveCtx.clearRect(0,0,WIDTH,HEIGHT);
   };
 });
 
@@ -1136,6 +1208,11 @@ document.querySelectorAll('.brush-type').forEach(btn=>{
 
 sizeInput.oninput=()=>{
   sizeValue.textContent=sizeInput.value;
+  updateBrushCursorSize();
+};
+
+eraserSizeInput.oninput=()=>{
+  eraserSizeValue.textContent=eraserSizeInput.value;
   updateBrushCursorSize();
 };
 opacityInput.oninput=()=>opacityValue.textContent=opacityInput.value;
@@ -1198,6 +1275,7 @@ function isTypingTarget(target){
 
 function activateTool(nextTool){
   tool = nextTool;
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
   document.querySelectorAll('.tool').forEach(btn=>{
     btn.classList.toggle('active', btn.dataset.tool === nextTool);
   });
@@ -1205,11 +1283,15 @@ function activateTool(nextTool){
 }
 
 function changeBrushSize(delta){
-  const min = Number(sizeInput.min) || 1;
-  const max = Number(sizeInput.max) || 80;
-  const next = Math.max(min, Math.min(max, Number(sizeInput.value) + delta));
-  sizeInput.value = String(next);
-  sizeValue.textContent = String(next);
+  const input = tool === 'eraser' ? eraserSizeInput : sizeInput;
+  const label = tool === 'eraser' ? eraserSizeValue : sizeValue;
+
+  const min = Number(input.min) || 1;
+  const max = Number(input.max) || 120;
+  const next = Math.max(min, Math.min(max, Number(input.value) + delta));
+
+  input.value = String(next);
+  label.textContent = String(next);
   updateBrushCursorSize();
 }
 
@@ -1296,6 +1378,7 @@ setTimeout(()=>document.getElementById('zoomReset').click(),50);
 
 window.addEventListener('pointercancel', e=>{
   finishStrokeImmediately(e.pointerId);
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
 });
 
 
@@ -1338,3 +1421,7 @@ canvas.addEventListener('pointerdown', e=>{
 window.addEventListener('resize', ()=>{
   updateBrushCursorSize();
 });
+
+sizeValue.textContent = sizeInput.value;
+eraserSizeValue.textContent = eraserSizeInput.value;
+updateBrushCursorSize();

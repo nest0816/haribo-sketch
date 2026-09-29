@@ -256,3 +256,31 @@ canvas{
 .brush-cursor.hand{
   display:none !important;
 }
+
+
+/* v19 active stroke overlay */
+.stage{
+  position:absolute;
+}
+.stage > canvas{
+  grid-area:1 / 1;
+}
+#canvas{
+  position:relative;
+  z-index:1;
+}
+.live-canvas{
+  position:absolute;
+  left:0;
+  top:0;
+  z-index:2;
+  pointer-events:none;
+  background:transparent !important;
+  box-shadow:none !important;
+}
+.brush-cursor{
+  z-index:30;
+}
+.eraser-size-field{
+  margin-top:-3px;
+}

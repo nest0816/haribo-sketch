@@ -98,6 +98,11 @@
             <input id="size" type="range" min="1" max="80" value="10" />
           </label>
 
+          <label class="field eraser-size-field">
+            <span>지우개 크기 <b id="eraserSizeValue">30</b>px</span>
+            <input id="eraserSize" type="range" min="2" max="120" value="30" />
+          </label>
+
           <label class="field">
             <span>투명도 <b id="opacityValue">100</b>%</span>
             <input id="opacity" type="range" min="5" max="100" value="100" />
@@ -159,6 +164,7 @@
           <div id="brushCursor" class="brush-cursor"></div>
           <div id="stage" class="stage">
             <canvas id="canvas" width="1400" height="900"></canvas>
+            <canvas id="liveCanvas" class="live-canvas" width="1400" height="900"></canvas>
           </div>
         </div>
 

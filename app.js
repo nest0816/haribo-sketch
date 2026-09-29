@@ -961,6 +961,7 @@ function emitDrawPoint(rawPoint){
 let lastPoint = null;
 
 canvas.addEventListener('pointerdown', e=>{
+  if(e.pointerType === 'mouse' && e.button !== 0) return;
   if(spaceDown || tool==='hand'){
     panning = true;
     panStart = {x:e.clientX-pan.x,y:e.clientY-pan.y};
@@ -1010,6 +1011,13 @@ function handleDrawMove(e){
 
   if(!drawing || e.pointerId !== activePointerId) return;
 
+  // 마우스/펜은 손을 뗀 뒤 hover pointermove가 계속 들어올 수 있음.
+  // buttons=0이면 더 이상 실제로 누르고 있는 상태가 아니므로 즉시 종료.
+  if((e.pointerType === 'mouse' || e.pointerType === 'pen') && e.buttons === 0){
+    finishStrokeImmediately(e.pointerId);
+    return;
+  }
+
   e.preventDefault();
 
   const p = canvasPointFromEvent(e);
@@ -1021,52 +1029,43 @@ function handleDrawMove(e){
 // 안정성을 위해 pointermove만 사용.
 canvas.addEventListener('pointermove', handleDrawMove, {passive:false});
 
-window.addEventListener('pointerup', async e=>{
-  if(e.pointerId !== activePointerId){
-    panning=false;
-    panStart=null;
-    return;
-  }
 
-  if(drawing){
-    flushNetworkSegments();
+async function saveFinishedStroke(segments){
+  if(!segments || !segments.length) return;
+  await persistStroke(segments);
+}
 
-    if(currentStrokeSegments.length === 0 && lastPoint){
-      const seg = {
-        strokeId: currentStrokeId,
-        x1: lastPoint.x - 0.01,
-        y1: lastPoint.y,
-        x2: lastPoint.x + 0.01,
-        y2: lastPoint.y,
-        width: getStyledWidth(lastPoint.pressure),
-        color: colorInput.value,
-        opacity: Number(opacityInput.value) / 100,
-        eraser: tool === 'eraser'
-      };
+function finishStrokeImmediately(pointerId){
+  if(activePointerId === null) return;
+  if(pointerId !== undefined && pointerId !== null && pointerId !== activePointerId) return;
 
-      drawSegment(seg);
-      currentStrokeSegments.push(seg);
-      queueNetworkSegment(seg);
-      flushNetworkSegments();
-    }
+  // 중요: 서버 저장보다 먼저 로컬 드로잉 상태를 즉시 종료한다.
+  const segmentsToSave = currentStrokeSegments.slice();
 
-    if(currentStrokeSegments.length){
-      const toSave = currentStrokeSegments.slice();
-      currentStrokeSegments = [];
-      await persistStroke(toSave);
-    }
-  }
+  drawing = false;
+  activePointerId = null;
+  panning = false;
+  panStart = null;
+  smoothPoint = null;
+  rawPointHistory = [];
+  lastPoint = null;
+  lastInputTime = 0;
 
-  drawing=false;
-  activePointerId=null;
-  panning=false;
-  panStart=null;
-  smoothPoint=null;
-  rawPointHistory=[];
-  lastPoint=null;
-  lastInputTime=0;
+  flushNetworkSegments();
+  currentStrokeSegments = [];
+
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
+
+  // 저장은 뒤에서 진행. 저장 중에도 절대 다시 선이 이어지지 않는다.
+  if(segmentsToSave.length){
+    saveFinishedStroke(segmentsToSave);
+  }
+}
+
+window.addEventListener('pointerup', e=>{
+  finishStrokeImmediately(e.pointerId);
 });
+
 
 document.querySelectorAll('.tool').forEach(btn=>{
   btn.onclick=()=>{
@@ -1241,19 +1240,7 @@ setTimeout(()=>document.getElementById('zoomReset').click(),50);
 
 
 window.addEventListener('pointercancel', e=>{
-  if(e.pointerId !== activePointerId) return;
-  drawing = false;
-  activePointerId = null;
-  currentStrokeSegments = [];
-  networkSegmentBuffer = [];
-  if(networkFlushTimer !== null){
-    clearTimeout(networkFlushTimer);
-    networkFlushTimer = null;
-  }
-  smoothPoint = null;
-  rawPointHistory = [];
-  lastPoint = null;
-  lastInputTime = 0;
+  finishStrokeImmediately(e.pointerId);
 });
 
 
@@ -1264,4 +1251,14 @@ window.addEventListener('pagehide', ()=>{
 
 window.addEventListener('beforeunload', ()=>{
   leaveRoomImmediately();
+});
+
+
+canvas.addEventListener('lostpointercapture', e=>{
+  finishStrokeImmediately(e.pointerId);
+});
+
+window.addEventListener('blur', ()=>{
+  // 창 포커스를 잃었을 때도 선이 붙잡힌 채 남지 않도록 종료
+  finishStrokeImmediately(activePointerId);
 });

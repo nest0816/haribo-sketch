@@ -193,3 +193,38 @@ input[type="range"]{width:100%;accent-color:var(--pink)}.color-row{display:flex;
   font-size:10px;
   color:var(--muted)
 }
+
+
+/* v16 chat readability */
+.chat-messages{
+  height:380px;
+  min-height:380px;
+  font-size:14px;
+}
+.chat-msg{
+  font-size:14px;
+  line-height:1.55;
+}
+.chat-msg b{
+  font-size:12px;
+  margin-bottom:4px;
+}
+.chat-msg .bubble{
+  padding:9px 11px;
+  border-radius:13px;
+  max-width:94%;
+}
+.chat-compose input{
+  font-size:14px;
+  padding:11px 12px;
+}
+.chat-compose button{
+  font-size:13px;
+  padding:10px 12px;
+}
+@media(max-width:1050px){
+  .chat-messages{height:340px;min-height:340px;}
+}
+@media(max-width:760px){
+  .chat-messages{height:320px;min-height:320px;}
+}

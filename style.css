@@ -452,3 +452,20 @@ canvas{
 .size-presets button.active b{
   color:#d72b80;
 }
+
+
+/* v22.2 clickable brand -> lobby */
+.brand-home{
+  cursor:pointer;
+  border-radius:14px;
+  padding:4px 7px 4px 4px;
+  margin-left:-4px;
+  transition:.16s ease;
+}
+.brand-home:hover{
+  background:rgba(255,255,255,.7);
+}
+.brand-home:focus-visible{
+  outline:2px solid #ff9cca;
+  outline-offset:3px;
+}

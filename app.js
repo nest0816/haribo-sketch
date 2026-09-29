@@ -34,6 +34,7 @@ const chatMessagesEl = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const chatSendBtn = document.getElementById('chatSendBtn');
 const brushCursor = document.getElementById('brushCursor');
+const brandHome = document.getElementById('brandHome');
 const toolSettingsTitle = document.getElementById('toolSettingsTitle');
 const brushOnlySettings = document.getElementById('brushOnlySettings');
 const brushExtraSettings = document.getElementById('brushExtraSettings');
@@ -865,6 +866,71 @@ async function connectRoomChannel(){
   });
 }
 
+
+async function returnToLobby(){
+  // 이미 로비면 새로고침하지 않고 그대로 둠
+  if(!roomId){
+    showLobby();
+    return;
+  }
+
+  // 정상적인 버튼 이동이므로 keepalive에만 의존하지 않고
+  // Supabase에서 현재 멤버를 즉시 제거.
+  if(supabaseClient){
+    try{
+      await supabaseClient.rpc('leave_room_member', {
+        p_room_id:roomId,
+        p_client_id:myId
+      });
+    }catch(err){
+      console.warn('leave room failed', err);
+    }
+
+    if(channel){
+      try{
+        await supabaseClient.removeChannel(channel);
+      }catch(err){}
+      channel = null;
+    }
+  }
+
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+
+  // 현재 방의 로컬 상태 정리
+  drawing = false;
+  activePointerId = null;
+  currentStrokeSegments = [];
+  networkSegmentBuffer = [];
+  remoteStrokeBuffers?.clear?.();
+
+  if(typeof clearCanvas === 'function'){
+    clearCanvas();
+  }
+
+  roomId = null;
+  roomMode = 'lobby';
+
+  params.delete('room');
+  params.delete('public');
+  history.replaceState({}, '', location.pathname);
+
+  updateRoomLabels();
+  showStatus('공개방 선택 대기');
+  showLobby();
+}
+
+brandHome?.addEventListener('click', ()=>{
+  returnToLobby();
+});
+
+brandHome?.addEventListener('keydown', e=>{
+  if(e.key === 'Enter' || e.key === ' '){
+    e.preventDefault();
+    returnToLobby();
+  }
+});
+
 async function setupRealtime(){
   if(!configured){
     showStatus('로컬 미리보기');
@@ -1427,52 +1493,6 @@ function activateTool(nextTool){
   });
   liveCtx?.clearRect?.(0,0,WIDTH,HEIGHT);
   syncToolSettingsUI();
-}
-
-function updateSizePresetActive(){
-  document.querySelectorAll('[data-size-preset]').forEach(btn=>{
-    btn.classList.toggle(
-      'active',
-      Number(btn.dataset.sizePreset) === currentToolSize()
-    );
-  });
-}
-
-function syncToolSettingsUI(){
-  const isEraser = tool === 'eraser';
-
-  toolSettingsTitle.textContent = isEraser ? '지우개' : '브러시';
-
-  brushOnlySettings?.classList.toggle('tool-settings-hidden', isEraser);
-  brushExtraSettings?.classList.toggle('tool-settings-hidden', isEraser);
-
-  const value = currentToolSize();
-  sizeInput.value = String(value);
-  sizeValue.textContent = String(value);
-
-  updateSizePresetActive();
-  updateBrushCursorSize();
-}
-
-document.querySelectorAll('[data-size-preset]').forEach(btn=>{
-  btn.addEventListener('click', ()=>{
-    const value = Number(btn.dataset.sizePreset);
-
-    if(tool === 'eraser') eraserSize = value;
-    else brushSize = value;
-
-    sizeInput.value = String(value);
-    sizeValue.textContent = String(value);
-
-    updateSizePresetActive();
-    updateBrushCursorSize();
-  });
-});
-
-document.querySelectorAll('.tool').forEach(btn=>{
-    btn.classList.toggle('active', btn.dataset.tool === nextTool);
-  });
-  updateBrushCursorSize();
 }
 
 function changeBrushSize(delta){

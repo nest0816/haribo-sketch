@@ -47,6 +47,9 @@ let smoothPoint = null;
 let currentStrokeId = null;
 let currentStrokeSegments = [];
 let activePointerId = null;
+let rawPointHistory = [];
+let networkSegmentBuffer = [];
+let networkFlushTimer = null;
 let expiresAt = Date.now() + ROOM_LIFETIME_MS;
 let cachedRows = [];
 
@@ -183,22 +186,31 @@ function getStyledWidth(pressure){
 function smooth(raw){
   const amount = Number(smoothingInput.value) / 100;
 
-  if(!smoothPoint){
-    smoothPoint = {...raw};
+  if(amount <= 0){
+    rawPointHistory = [{...raw}];
     return {...raw};
   }
 
-  // 초반 버전 느낌에 가깝게:
-  // 보정은 가볍게만 적용하고 손 위치를 크게 뒤쫓지 않음.
-  const alpha = 1 - (amount * 0.55);
+  rawPointHistory.push({...raw});
 
-  smoothPoint = {
-    x: smoothPoint.x + (raw.x - smoothPoint.x) * alpha,
-    y: smoothPoint.y + (raw.y - smoothPoint.y) * alpha,
-    pressure: raw.pressure
+  // 보정 강도에 따라 최근 2~4개 점만 평균.
+  // 긴 지연을 만드는 누적 EMA는 사용하지 않음.
+  const windowSize = amount < .34 ? 2 : (amount < .68 ? 3 : 4);
+  if(rawPointHistory.length > windowSize){
+    rawPointHistory.shift();
+  }
+
+  let sx=0, sy=0;
+  for(const p of rawPointHistory){
+    sx += p.x;
+    sy += p.y;
+  }
+
+  return {
+    x:sx/rawPointHistory.length,
+    y:sy/rawPointHistory.length,
+    pressure:raw.pressure
   };
-
-  return {...smoothPoint};
 }
 
 function drawSegment(seg){
@@ -605,8 +617,14 @@ async function connectRoomChannel(){
 
   channel
     .on('broadcast',{event:'stroke'}, ({payload}) => {
+      // 이전 버전 클라이언트 호환
       if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
-      drawSegment(payload.segment);
+      if(payload.segment) drawSegment(payload.segment);
+    })
+    .on('broadcast',{event:'stroke_batch'}, ({payload}) => {
+      if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
+      const segments = Array.isArray(payload.segments) ? payload.segments : [];
+      segments.forEach(drawSegment);
     })
     .on('broadcast',{event:'owner_clear'}, async () => {
       await loadRoomHistory();
@@ -859,6 +877,34 @@ function isInsideCanvasPoint(p){
   return p.x >= 0 && p.x <= WIDTH && p.y >= 0 && p.y <= HEIGHT;
 }
 
+
+function queueNetworkSegment(seg){
+  networkSegmentBuffer.push(seg);
+
+  if(networkFlushTimer !== null) return;
+
+  networkFlushTimer = window.setTimeout(()=>{
+    flushNetworkSegments();
+  }, 30);
+}
+
+function flushNetworkSegments(){
+  if(networkFlushTimer !== null){
+    clearTimeout(networkFlushTimer);
+    networkFlushTimer = null;
+  }
+
+  if(!networkSegmentBuffer.length) return;
+
+  const segments = networkSegmentBuffer.splice(0, networkSegmentBuffer.length);
+
+  broadcast('stroke_batch',{
+    ownerId:myId,
+    layerNo:activeLayer,
+    segments
+  });
+}
+
 function emitDrawPoint(rawPoint){
   if(!isInsideCanvasPoint(rawPoint)) return;
 
@@ -869,38 +915,36 @@ function emitDrawPoint(rawPoint){
     return;
   }
 
-  const dx = p.x - lastPoint.x;
-  const dy = p.y - lastPoint.y;
-  const distance = Math.hypot(dx, dy);
+  const distance = Math.hypot(p.x-lastPoint.x, p.y-lastPoint.y);
 
-  // 브라우저 좌표가 비정상적으로 크게 튈 때만 연결 끊기
-  if(distance > 180){
-    smoothPoint = {...rawPoint};
+  // 실제 입력 장치에서 발생할 수 없는 수준의 좌표 점프만 차단.
+  if(distance > 260){
+    rawPointHistory = [{...rawPoint}];
     lastPoint = {...rawPoint};
     return;
   }
 
   const seg = {
-    strokeId: currentStrokeId,
-    x1: lastPoint.x,
-    y1: lastPoint.y,
-    x2: p.x,
-    y2: p.y,
-    width: getStyledWidth(p.pressure),
-    color: colorInput.value,
-    opacity: Number(opacityInput.value) / 100,
-    eraser: tool === 'eraser'
+    strokeId:currentStrokeId,
+    x1:lastPoint.x,
+    y1:lastPoint.y,
+    x2:p.x,
+    y2:p.y,
+    width:getStyledWidth(p.pressure),
+    color:colorInput.value,
+    opacity:Number(opacityInput.value)/100,
+    eraser:tool==='eraser'
   };
 
+  // 1) 로컬 그리기를 무조건 먼저 처리
   drawSegment(seg);
 
-  broadcast('stroke',{
-    ownerId: myId,
-    layerNo: activeLayer,
-    segment: seg
-  });
-
+  // 2) DB 저장용 스트로크에는 바로 추가
   currentStrokeSegments.push(seg);
+
+  // 3) 네트워크 전송은 묶어서 나중에 처리
+  queueNetworkSegment(seg);
+
   lastPoint = p;
 }
 
@@ -920,6 +964,12 @@ canvas.addEventListener('pointerdown', e=>{
   activePointerId = e.pointerId;
   drawing = true;
   smoothPoint = null;
+  rawPointHistory = [];
+  networkSegmentBuffer = [];
+  if(networkFlushTimer !== null){
+    clearTimeout(networkFlushTimer);
+    networkFlushTimer = null;
+  }
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
 
@@ -936,7 +986,10 @@ canvas.addEventListener('pointerdown', e=>{
   canvas.setPointerCapture?.(e.pointerId);
 });
 
-canvas.addEventListener('pointermove', e=>{
+
+
+
+function handleDrawMove(e){
   if(panning && panStart){
     pan.x = e.clientX-panStart.x;
     pan.y = e.clientY-panStart.y;
@@ -946,11 +999,21 @@ canvas.addEventListener('pointermove', e=>{
 
   if(!drawing || e.pointerId !== activePointerId) return;
 
+  e.preventDefault();
+
   const p = canvasPointFromEvent(e);
   if(!isInsideCanvasPoint(p)) return;
 
   emitDrawPoint(p);
-});
+}
+
+// 지원 브라우저에서는 더 촘촘하고 지연이 적은 raw 입력 사용.
+// 미지원 브라우저는 기존 pointermove로 자동 fallback.
+const drawMoveEvent = ('onpointerrawupdate' in window)
+  ? 'pointerrawupdate'
+  : 'pointermove';
+
+canvas.addEventListener(drawMoveEvent, handleDrawMove, {passive:false});
 
 window.addEventListener('pointerup', async e=>{
   if(e.pointerId !== activePointerId){
@@ -960,6 +1023,8 @@ window.addEventListener('pointerup', async e=>{
   }
 
   if(drawing){
+    flushNetworkSegments();
+
     if(currentStrokeSegments.length === 0 && lastPoint){
       const seg = {
         strokeId: currentStrokeId,
@@ -974,12 +1039,9 @@ window.addEventListener('pointerup', async e=>{
       };
 
       drawSegment(seg);
-      broadcast('stroke',{
-        ownerId:myId,
-        layerNo:activeLayer,
-        segment:seg
-      });
       currentStrokeSegments.push(seg);
+      queueNetworkSegment(seg);
+      flushNetworkSegments();
     }
 
     if(currentStrokeSegments.length){
@@ -994,6 +1056,7 @@ window.addEventListener('pointerup', async e=>{
   panning=false;
   panStart=null;
   smoothPoint=null;
+  rawPointHistory=[];
   lastPoint=null;
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
 });
@@ -1175,7 +1238,13 @@ window.addEventListener('pointercancel', e=>{
   drawing = false;
   activePointerId = null;
   currentStrokeSegments = [];
+  networkSegmentBuffer = [];
+  if(networkFlushTimer !== null){
+    clearTimeout(networkFlushTimer);
+    networkFlushTimer = null;
+  }
   smoothPoint = null;
+  rawPointHistory = [];
   lastPoint = null;
 });
 

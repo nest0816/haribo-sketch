@@ -188,13 +188,13 @@ function smooth(raw){
     return {...raw};
   }
 
-  // 기존 방식보다 훨씬 덜 뒤처지는 보정.
-  // 0%는 즉시 따라오고, 95%여도 지나치게 끌려오지 않게 제한.
-  const follow = 1 - Math.min(0.82, amount * 0.72);
+  // 초반 버전 느낌에 가깝게:
+  // 보정은 가볍게만 적용하고 손 위치를 크게 뒤쫓지 않음.
+  const alpha = 1 - (amount * 0.55);
 
   smoothPoint = {
-    x: smoothPoint.x + (raw.x - smoothPoint.x) * follow,
-    y: smoothPoint.y + (raw.y - smoothPoint.y) * follow,
+    x: smoothPoint.x + (raw.x - smoothPoint.x) * alpha,
+    y: smoothPoint.y + (raw.y - smoothPoint.y) * alpha,
     pressure: raw.pressure
   };
 
@@ -256,6 +256,7 @@ function showStatus(message, isError=false){
 
 const PUBLIC_ROOM_LIMIT = 30;
 let heartbeatTimer = null;
+let lobbyRefreshTimer = null;
 
 async function fetchFixedRoomCounts(){
   if(!supabaseClient) return;
@@ -331,6 +332,8 @@ async function joinFixedPublicRoom(targetRoomId){
 
   updateRoomLabels();
   lobbyOverlay.classList.add('hidden');
+  clearInterval(lobbyRefreshTimer);
+  lobbyRefreshTimer = null;
   return true;
 }
 
@@ -339,7 +342,15 @@ function showLobby(){
   lobbyOverlay.classList.remove('hidden');
   lobbyMessage.classList.remove('error');
   lobbyMessage.textContent = '방이 30명이면 자리가 날 때까지 기다렸다가 들어갈 수 있어요.';
+
   fetchFixedRoomCounts();
+
+  clearInterval(lobbyRefreshTimer);
+  lobbyRefreshTimer = setInterval(()=>{
+    if(!lobbyOverlay.classList.contains('hidden')){
+      fetchFixedRoomCounts();
+    }
+  }, 1000);
 }
 
 document.querySelectorAll('.public-room-choice').forEach(btn=>{
@@ -397,8 +408,32 @@ function startHeartbeat(){
   heartbeatTimer = setInterval(()=>{
     heartbeatRoomMember();
     refreshOccupancy();
-  }, 15000);
+  }, 3000);
 }
+
+function leaveRoomImmediately(){
+  if(!configured || !roomId || !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY) return;
+
+  const url = `${cfg.SUPABASE_URL}/rest/v1/rpc/leave_room_member`;
+
+  try{
+    fetch(url, {
+      method:'POST',
+      keepalive:true,
+      headers:{
+        'Content-Type':'application/json',
+        'apikey':cfg.SUPABASE_ANON_KEY,
+        'Authorization':`Bearer ${cfg.SUPABASE_ANON_KEY}`
+      },
+      body:JSON.stringify({
+        p_room_id:roomId,
+        p_client_id:myId
+      })
+    }).catch(()=>{});
+  }catch(e){}
+}
+
+
 
 async function ensureRoom(){
   const { data, error } = await supabaseClient.rpc('ensure_room', {
@@ -838,53 +873,34 @@ function emitDrawPoint(rawPoint){
   const dy = p.y - lastPoint.y;
   const distance = Math.hypot(dx, dy);
 
-  // 비정상적으로 먼 좌표가 한 번 튀는 경우 연결하지 않음.
-  // 일반적인 빠른 드로잉은 유지하면서 순간 좌표 튐만 차단.
-  const jumpLimit = Math.max(140, Number(sizeInput.value) * 18);
-  if(distance > jumpLimit){
+  // 브라우저 좌표가 비정상적으로 크게 튈 때만 연결 끊기
+  if(distance > 180){
     smoothPoint = {...rawPoint};
     lastPoint = {...rawPoint};
     return;
   }
 
-  const step = Math.max(1.5, Math.min(5, Number(sizeInput.value) * 0.32));
-  const pieces = Math.max(1, Math.ceil(distance / step));
+  const seg = {
+    strokeId: currentStrokeId,
+    x1: lastPoint.x,
+    y1: lastPoint.y,
+    x2: p.x,
+    y2: p.y,
+    width: getStyledWidth(p.pressure),
+    color: colorInput.value,
+    opacity: Number(opacityInput.value) / 100,
+    eraser: tool === 'eraser'
+  };
 
-  const start = {...lastPoint};
-  let prev = start;
+  drawSegment(seg);
 
-  for(let i=1; i<=pieces; i++){
-    const t = i / pieces;
-    const q = {
-      x: start.x + dx * t,
-      y: start.y + dy * t,
-      pressure: start.pressure + (p.pressure - start.pressure) * t
-    };
+  broadcast('stroke',{
+    ownerId: myId,
+    layerNo: activeLayer,
+    segment: seg
+  });
 
-    const seg = {
-      strokeId: currentStrokeId,
-      x1: prev.x,
-      y1: prev.y,
-      x2: q.x,
-      y2: q.y,
-      width: getStyledWidth(q.pressure),
-      color: colorInput.value,
-      opacity: Number(opacityInput.value) / 100,
-      eraser: tool === 'eraser'
-    };
-
-    drawSegment(seg);
-
-    broadcast('stroke',{
-      ownerId: myId,
-      layerNo: activeLayer,
-      segment: seg
-    });
-
-    currentStrokeSegments.push(seg);
-    prev = q;
-  }
-
+  currentStrokeSegments.push(seg);
   lastPoint = p;
 }
 
@@ -930,16 +946,10 @@ canvas.addEventListener('pointermove', e=>{
 
   if(!drawing || e.pointerId !== activePointerId) return;
 
-  const events = typeof e.getCoalescedEvents === 'function'
-    ? e.getCoalescedEvents()
-    : [e];
+  const p = canvasPointFromEvent(e);
+  if(!isInsideCanvasPoint(p)) return;
 
-  for(const ev of events){
-    if(ev.pointerId !== activePointerId) continue;
-    const p = canvasPointFromEvent(ev);
-    if(!isInsideCanvasPoint(p)) continue;
-    emitDrawPoint(p);
-  }
+  emitDrawPoint(p);
 });
 
 window.addEventListener('pointerup', async e=>{
@@ -950,10 +960,6 @@ window.addEventListener('pointerup', async e=>{
   }
 
   if(drawing){
-    // 손을 떼는 좌표까지 강제로 직선을 잇지 않음.
-    // pointermove에서 실제로 받은 좌표까지만 저장해 '선 튐' 방지.
-
-    // 탭만 한 경우 점 하나 생성
     if(currentStrokeSegments.length === 0 && lastPoint){
       const seg = {
         strokeId: currentStrokeId,
@@ -1171,4 +1177,14 @@ window.addEventListener('pointercancel', e=>{
   currentStrokeSegments = [];
   smoothPoint = null;
   lastPoint = null;
+});
+
+
+// 탭 닫기/페이지 이동 시 DB의 방 인원에서도 즉시 제거
+window.addEventListener('pagehide', ()=>{
+  leaveRoomImmediately();
+});
+
+window.addEventListener('beforeunload', ()=>{
+  leaveRoomImmediately();
 });

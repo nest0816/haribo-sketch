@@ -123,3 +123,73 @@ input[type="range"]{width:100%;accent-color:var(--pink)}.color-row{display:flex;
   border-radius:999px;
   padding:3px 6px;
 }
+
+.hidden{display:none!important}
+
+.lobby-overlay{
+  position:fixed;
+  inset:0;
+  z-index:999;
+  display:grid;
+  place-items:center;
+  padding:20px;
+  background:rgba(247,244,255,.88);
+  backdrop-filter:blur(18px);
+}
+.lobby-card{
+  width:min(520px,100%);
+  background:#fff;
+  border:1px solid #eadff7;
+  border-radius:26px;
+  padding:28px;
+  box-shadow:0 24px 70px rgba(95,67,140,.18);
+}
+.lobby-logo{
+  width:54px;height:54px;border-radius:18px;
+  display:grid;place-items:center;
+  margin:0 auto 12px;
+  color:#fff;font-size:25px;
+  background:linear-gradient(135deg,var(--pink),var(--purple));
+}
+.lobby-card h2{margin:0;text-align:center;font-size:23px}
+.lobby-card>p{margin:8px 0 22px;text-align:center;color:var(--muted);font-size:13px}
+.lobby-name-field{display:block;margin-bottom:16px}
+.lobby-name-field span{display:block;font-size:12px;color:var(--muted);margin-bottom:7px}
+.lobby-name-field input{
+  width:100%;border:1px solid var(--line);border-radius:13px;padding:12px 13px;outline:none
+}
+.lobby-name-field input:focus{border-color:#ff9cca}
+.public-room-list{display:grid;gap:9px}
+.public-room-choice{
+  width:100%;display:flex;justify-content:space-between;align-items:center;
+  padding:14px 15px;text-align:left
+}
+.public-room-choice div{display:flex;flex-direction:column;gap:3px}
+.public-room-choice b{font-size:14px}
+.public-room-choice span{font-size:10px;color:var(--muted)}
+.public-room-choice strong{font-size:14px;color:#d72b80}
+.public-room-choice.full{
+  opacity:.48;
+  cursor:not-allowed;
+  background:#f6f3f8
+}
+.public-room-choice.full:hover{transform:none;box-shadow:none}
+.lobby-message{
+  margin-top:13px;
+  padding:10px 12px;
+  border-radius:12px;
+  background:#faf8ff;
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.45;
+  text-align:center
+}
+.lobby-message.error{
+  color:#c13b5b;
+  background:#fff3f6
+}
+.my-nickname{
+  margin:-4px 0 10px;
+  font-size:10px;
+  color:var(--muted)
+}

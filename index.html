@@ -7,13 +7,57 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+
+  <div id="lobbyOverlay" class="lobby-overlay hidden">
+    <div class="lobby-card">
+      <div class="lobby-logo">✦</div>
+      <h2>Haribo Sketch Live</h2>
+      <p>닉네임을 정하고 원하는 공개방에 들어가세요.</p>
+
+      <label class="lobby-name-field">
+        <span>닉네임</span>
+        <input id="lobbyNickname" maxlength="20" placeholder="닉네임 입력" />
+      </label>
+
+      <div class="public-room-list">
+        <button class="public-room-choice" data-fixed-room="public-1">
+          <div>
+            <b>1번방</b>
+            <span>8분 그림방</span>
+          </div>
+          <strong><span class="room-count" data-room-count="public-1">0</span>/30</strong>
+        </button>
+
+        <button class="public-room-choice" data-fixed-room="public-2">
+          <div>
+            <b>2번방</b>
+            <span>8분 그림방</span>
+          </div>
+          <strong><span class="room-count" data-room-count="public-2">0</span>/30</strong>
+        </button>
+
+        <button class="public-room-choice" data-fixed-room="public-3">
+          <div>
+            <b>3번방</b>
+            <span>8분 그림방</span>
+          </div>
+          <strong><span class="room-count" data-room-count="public-3">0</span>/30</strong>
+        </button>
+      </div>
+
+      <div id="lobbyMessage" class="lobby-message">
+        방이 30명이면 자리가 날 때까지 기다렸다가 들어갈 수 있어요.
+      </div>
+    </div>
+  </div>
+
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
         <div class="logo">✦</div>
         <div>
           <h1>Haribo Sketch Live</h1>
-          <p>공개방은 최대 30명 · 꽉 차면 다음 방으로 자동 입장</p>
+          <p>공개방 3개 · 방마다 최대 30명 · 원하는 방 직접 선택</p>
         </div>
       </div>
 
@@ -133,7 +177,11 @@
         </section>
 
         <section>
-          <h2>참여자 <span id="participantCount">1</span></h2>
+          <div class="section-title-row">
+            <h2>참여자 <span id="participantCount">1</span></h2>
+            <button id="nicknameBtn" class="mini">닉네임 변경</button>
+          </div>
+          <div id="myNickname" class="my-nickname"></div>
           <div id="participants" class="participants"></div>
         </section>
 

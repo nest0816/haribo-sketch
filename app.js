@@ -25,6 +25,13 @@ const chatMessagesEl = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const chatSendBtn = document.getElementById('chatSendBtn');
 
+const lobbyOverlay = document.getElementById('lobbyOverlay');
+const lobbyNickname = document.getElementById('lobbyNickname');
+const lobbyMessage = document.getElementById('lobbyMessage');
+const nicknameBtn = document.getElementById('nicknameBtn');
+const myNicknameEl = document.getElementById('myNickname');
+
+
 const WIDTH = canvas.width, HEIGHT = canvas.height;
 const ROOM_LIFETIME_MS = 8 * 60 * 1000;
 
@@ -48,26 +55,44 @@ if(!myId){
   myId = crypto.randomUUID();
   localStorage.setItem(USER_ID_KEY, myId);
 }
-const myName = 'guest-' + myId.slice(0,4);
+const NICKNAME_KEY = 'haribo-sketch-nickname-v1';
+let myName = (localStorage.getItem(NICKNAME_KEY) || `guest-${myId.slice(0,4)}`).slice(0,20);
 
 const params = new URLSearchParams(location.search);
 let roomId = params.get('room');
+const FIXED_PUBLIC_ROOMS = ['public-1','public-2','public-3'];
+const isFixedPublicRoom = roomId && FIXED_PUBLIC_ROOMS.includes(roomId);
 const explicitRoom = Boolean(roomId);
-let roomMode = params.get('public') === '1' ? 'public' : (explicitRoom ? 'private' : 'public');
+let roomMode = isFixedPublicRoom || params.get('public') === '1'
+  ? 'public'
+  : (explicitRoom ? 'private' : 'lobby');
 
 const roomModeBadge = document.getElementById('roomModeBadge');
 const roomDescription = document.getElementById('roomDescription');
 const roomOccupancy = document.getElementById('roomOccupancy');
 
+function friendlyRoomName(id){
+  if(id === 'public-1') return '1번방';
+  if(id === 'public-2') return '2번방';
+  if(id === 'public-3') return '3번방';
+  return id || '방 선택 전';
+}
+
 function updateRoomLabels(){
-  roomCodeLabel.textContent = roomId || '찾는 중…';
+  roomCodeLabel.textContent = friendlyRoomName(roomId);
+
   if(roomMode === 'public'){
     roomModeBadge.textContent = 'PUBLIC';
-    roomDescription.textContent = '최대 30명 공개방 · 꽉 차면 다음 방으로 자동 배정돼요.';
-  }else{
+    roomDescription.textContent = '공개방 · 최대 30명 · 자리가 나면 다시 들어올 수 있어요.';
+  }else if(roomMode === 'private'){
     roomModeBadge.textContent = 'PRIVATE';
     roomDescription.textContent = '이 링크를 공유하면 친구들이 같은 방으로 들어올 수 있어요.';
+  }else{
+    roomModeBadge.textContent = 'LOBBY';
+    roomDescription.textContent = '공개방을 선택해주세요.';
   }
+
+  if(myNicknameEl) myNicknameEl.textContent = `내 닉네임: ${myName}`;
 }
 updateRoomLabels();
 
@@ -155,15 +180,24 @@ function getStyledWidth(pressure){
 }
 
 function smooth(raw){
-  const amount = Number(smoothingInput.value)/100;
-  if(!smoothPoint){ smoothPoint = raw; return raw; }
-  const keep = amount * .9;
+  const amount = Number(smoothingInput.value) / 100;
+
+  if(!smoothPoint){
+    smoothPoint = {...raw};
+    return {...raw};
+  }
+
+  // 기존 방식보다 훨씬 덜 뒤처지는 보정.
+  // 0%는 즉시 따라오고, 95%여도 지나치게 끌려오지 않게 제한.
+  const follow = 1 - Math.min(0.82, amount * 0.72);
+
   smoothPoint = {
-    x:smoothPoint.x*keep + raw.x*(1-keep),
-    y:smoothPoint.y*keep + raw.y*(1-keep),
-    pressure:raw.pressure
+    x: smoothPoint.x + (raw.x - smoothPoint.x) * follow,
+    y: smoothPoint.y + (raw.y - smoothPoint.y) * follow,
+    pressure: raw.pressure
   };
-  return smoothPoint;
+
+  return {...smoothPoint};
 }
 
 function drawSegment(seg){
@@ -222,39 +256,107 @@ function showStatus(message, isError=false){
 const PUBLIC_ROOM_LIMIT = 30;
 let heartbeatTimer = null;
 
-async function assignPublicRoom(){
+async function fetchFixedRoomCounts(){
   if(!supabaseClient) return;
 
-  showStatus('공개방 찾는 중…');
+  const { data, error } = await supabaseClient.rpc('fixed_public_room_counts');
 
-  const { data, error } = await supabaseClient.rpc('join_public_room_v2', {
+  if(error){
+    console.error('fixed_public_room_counts failed', error);
+    lobbyMessage.textContent = '방 인원을 불러오지 못했어요. 잠시 후 다시 시도해주세요.';
+    lobbyMessage.classList.add('error');
+    return;
+  }
+
+  const rows = Array.isArray(data) ? data : [];
+
+  FIXED_PUBLIC_ROOMS.forEach(id=>{
+    const row = rows.find(r=>r.room_id === id);
+    const count = Number(row?.active_count || 0);
+    const countEl = document.querySelector(`[data-room-count="${id}"]`);
+    const btn = document.querySelector(`[data-fixed-room="${id}"]`);
+
+    if(countEl) countEl.textContent = String(count);
+
+    if(btn){
+      const full = count >= 30;
+      btn.classList.toggle('full', full);
+      btn.disabled = full;
+      btn.title = full ? '현재 30명이라 입장할 수 없어요.' : '';
+    }
+  });
+}
+
+async function joinFixedPublicRoom(targetRoomId){
+  const nickname = (lobbyNickname.value.trim() || myName || `guest-${myId.slice(0,4)}`).slice(0,20);
+  myName = nickname;
+  localStorage.setItem(NICKNAME_KEY, myName);
+
+  lobbyMessage.classList.remove('error');
+  lobbyMessage.textContent = '방에 들어가는 중…';
+
+  const { data, error } = await supabaseClient.rpc('join_fixed_public_room', {
+    p_room_id: targetRoomId,
     p_client_id: myId,
     p_nickname: myName
   });
 
   if(error){
-    console.error('join_public_room_v2 failed', error);
-    throw error;
+    console.error('join_fixed_public_room failed', error);
+    lobbyMessage.textContent = '입장에 실패했어요. 잠시 후 다시 시도해주세요.';
+    lobbyMessage.classList.add('error');
+    await fetchFixedRoomCounts();
+    return false;
   }
 
-  const assigned = typeof data === 'string' ? JSON.parse(data) : data;
+  const result = typeof data === 'string' ? JSON.parse(data) : data;
 
-  if(!assigned || !assigned.room_id || !assigned.expires_at){
-    console.error('Bad room assignment payload:', assigned);
-    throw new Error('공개방 배정 결과가 올바르지 않습니다.');
+  if(!result?.ok){
+    lobbyMessage.textContent = result?.reason === 'full'
+      ? '이 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.'
+      : '지금은 입장할 수 없어요.';
+    lobbyMessage.classList.add('error');
+    await fetchFixedRoomCounts();
+    return false;
   }
 
-  roomId = assigned.room_id;
+  roomId = targetRoomId;
   roomMode = 'public';
-  expiresAt = new Date(assigned.expires_at).getTime();
+  expiresAt = new Date(result.expires_at).getTime();
 
   params.set('room', roomId);
   params.set('public', '1');
   history.replaceState({}, '', `${location.pathname}?${params.toString()}`);
 
   updateRoomLabels();
-  showStatus('공개방 입장 완료');
+  lobbyOverlay.classList.add('hidden');
+  return true;
 }
+
+function showLobby(){
+  lobbyNickname.value = myName;
+  lobbyOverlay.classList.remove('hidden');
+  lobbyMessage.classList.remove('error');
+  lobbyMessage.textContent = '방이 30명이면 자리가 날 때까지 기다렸다가 들어갈 수 있어요.';
+  fetchFixedRoomCounts();
+}
+
+document.querySelectorAll('.public-room-choice').forEach(btn=>{
+  btn.addEventListener('click', async ()=>{
+    if(btn.disabled) return;
+    const ok = await joinFixedPublicRoom(btn.dataset.fixedRoom);
+    if(ok){
+      await enterCurrentRoom();
+    }
+  });
+});
+
+lobbyNickname.addEventListener('keydown', e=>{
+  if(e.key === 'Enter'){
+    const firstOpen = [...document.querySelectorAll('.public-room-choice')].find(b=>!b.disabled);
+    firstOpen?.click();
+  }
+});
 
 async function registerPrivateRoomMember(){
   if(!supabaseClient || !roomId) return;
@@ -412,11 +514,111 @@ async function undoMyLastStroke(){
   setTimeout(()=>showStatus('실시간 연결됨'), 1000);
 }
 
+
+async function applyNicknameChange(nextName){
+  const cleaned = (nextName || '').trim().slice(0,20);
+  if(!cleaned) return;
+
+  myName = cleaned;
+  localStorage.setItem(NICKNAME_KEY, myName);
+  updateRoomLabels();
+
+  if(channel){
+    await channel.track({
+      id:myId,
+      name:myName,
+      joined_at:new Date().toISOString()
+    });
+  }
+
+  if(supabaseClient && roomId){
+    await supabaseClient.rpc('touch_room_member', {
+      p_room_id: roomId,
+      p_client_id: myId,
+      p_nickname: myName
+    });
+  }
+}
+
+nicknameBtn?.addEventListener('click', async ()=>{
+  const next = prompt('새 닉네임을 입력해주세요. (최대 20자)', myName);
+  if(next === null) return;
+  await applyNicknameChange(next);
+});
+
+async function enterCurrentRoom(){
+  showStatus('그림 불러오는 중…');
+
+  await ensureRoom();
+  await registerPrivateRoomMember();
+  await Promise.all([loadRoomHistory(), loadChatHistory()]);
+  await connectRoomChannel();
+}
+
+async function connectRoomChannel(){
+  if(channel){
+    try{ await supabaseClient.removeChannel(channel); }catch(e){}
+  }
+
+  channel = supabaseClient.channel(`room:${roomId}`, {
+    config:{
+      broadcast:{self:false},
+      presence:{key:myId}
+    }
+  });
+
+  channel
+    .on('broadcast',{event:'stroke'}, ({payload}) => {
+      if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
+      drawSegment(payload.segment);
+    })
+    .on('broadcast',{event:'owner_clear'}, async () => {
+      await loadRoomHistory();
+    })
+    .on('broadcast',{event:'owner_undo'}, async () => {
+      await loadRoomHistory();
+    })
+    .on('broadcast',{event:'chat'}, ({payload}) => {
+      appendChat(payload);
+    })
+    .on('broadcast',{event:'room_expired'}, async ({payload}) => {
+      clearCanvas();
+      cachedRows = [];
+      renderChat([]);
+      if(payload?.expiresAt){
+        expiresAt = payload.expiresAt;
+      }else{
+        await ensureRoom();
+      }
+    })
+    .on('presence',{event:'sync'}, () => {
+      const state = channel.presenceState();
+      const people = Object.values(state).flat();
+      renderParticipants(people);
+      if(roomOccupancy) roomOccupancy.textContent = String(people.length);
+    });
+
+  await channel.subscribe(async status => {
+    if(status === 'SUBSCRIBED'){
+      showStatus('실시간 연결됨');
+      await channel.track({
+        id:myId,
+        name:myName,
+        joined_at:new Date().toISOString()
+      });
+      startHeartbeat();
+    }else{
+      showStatus(status.toLowerCase());
+    }
+  });
+}
+
 async function setupRealtime(){
   if(!configured){
     showStatus('로컬 미리보기');
     renderParticipants([{id:myId,name:myName}]);
     renderChat([]);
+    updateRoomLabels();
     return;
   }
 
@@ -426,69 +628,41 @@ async function setupRealtime(){
   );
 
   try{
-    showStatus('방 찾는 중…');
-
-    if(!explicitRoom){
-      await assignPublicRoom();
-    }else{
-      await ensureRoom();
-      await registerPrivateRoomMember();
-      updateRoomLabels();
+    if(!roomId){
+      showStatus('공개방 선택 대기');
+      showLobby();
+      return;
     }
 
-    await Promise.all([loadRoomHistory(), loadChatHistory()]);
-
-    channel = supabaseClient.channel(`room:${roomId}`, {
-      config:{
-        broadcast:{self:false},
-        presence:{key:myId}
-      }
-    });
-
-    channel
-      .on('broadcast',{event:'stroke'}, ({payload}) => {
-        if(payload.ownerId === myId && hiddenLayers.has(Number(payload.layerNo || 1))) return;
-        drawSegment(payload.segment);
-      })
-      .on('broadcast',{event:'owner_clear'}, async () => {
-        await loadRoomHistory();
-      })
-      .on('broadcast',{event:'owner_undo'}, async () => {
-        await loadRoomHistory();
-      })
-      .on('broadcast',{event:'chat'}, ({payload}) => {
-        appendChat(payload);
-      })
-      .on('broadcast',{event:'room_expired'}, async ({payload}) => {
-        clearCanvas();
-        cachedRows = [];
-        renderChat([]);
-        if(payload?.expiresAt){
-          expiresAt = payload.expiresAt;
-        }else{
-          await ensureRoom();
-        }
-      })
-      .on('presence',{event:'sync'}, () => {
-        const state = channel.presenceState();
-        const people = Object.values(state).flat();
-        renderParticipants(people);
-        if(roomOccupancy) roomOccupancy.textContent = String(people.length);
+    // 고정 공개방 URL 직접 접속 시에도 30명 제한 검사
+    if(FIXED_PUBLIC_ROOMS.includes(roomId)){
+      const { data, error } = await supabaseClient.rpc('join_fixed_public_room', {
+        p_room_id: roomId,
+        p_client_id: myId,
+        p_nickname: myName
       });
 
-    await channel.subscribe(async status => {
-      if(status === 'SUBSCRIBED'){
-        showStatus('실시간 연결됨');
-        await channel.track({
-          id:myId,
-          name:myName,
-          joined_at:new Date().toISOString()
-        });
-        startHeartbeat();
-      } else {
-        showStatus(status.toLowerCase());
+      if(error) throw error;
+
+      const result = typeof data === 'string' ? JSON.parse(data) : data;
+
+      if(!result?.ok){
+        roomId = null;
+        roomMode = 'lobby';
+        params.delete('room');
+        params.delete('public');
+        history.replaceState({}, '', location.pathname);
+        updateRoomLabels();
+        showLobby();
+        lobbyMessage.textContent = '그 방은 지금 30명이에요. 자리가 나면 다시 입장할 수 있어요.';
+        lobbyMessage.classList.add('error');
+        return;
       }
-    });
+
+      expiresAt = new Date(result.expires_at).getTime();
+    }
+
+    await enterCurrentRoom();
   }catch(err){
     console.error('setupRealtime failed:', err);
     showStatus('방 연결 오류 — 새로고침해주세요', true);
@@ -643,6 +817,60 @@ function updateCountdown(){
     `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
+
+function emitDrawPoint(rawPoint){
+  const p = smooth(rawPoint);
+
+  if(!lastPoint){
+    lastPoint = p;
+    return;
+  }
+
+  const dx = p.x - lastPoint.x;
+  const dy = p.y - lastPoint.y;
+  const distance = Math.hypot(dx, dy);
+
+  // 빠르게 그릴 때 pointermove 간격이 벌어져도 중간 점을 채워줌.
+  const step = Math.max(1.5, Math.min(6, Number(sizeInput.value) * 0.35));
+  const pieces = Math.max(1, Math.ceil(distance / step));
+
+  let prev = lastPoint;
+
+  for(let i=1; i<=pieces; i++){
+    const t = i / pieces;
+    const q = {
+      x: lastPoint.x + dx * t,
+      y: lastPoint.y + dy * t,
+      pressure: lastPoint.pressure + (p.pressure - lastPoint.pressure) * t
+    };
+
+    const seg = {
+      strokeId: currentStrokeId,
+      x1: prev.x,
+      y1: prev.y,
+      x2: q.x,
+      y2: q.y,
+      width: getStyledWidth(q.pressure),
+      color: colorInput.value,
+      opacity: Number(opacityInput.value) / 100,
+      eraser: tool === 'eraser'
+    };
+
+    drawSegment(seg);
+
+    broadcast('stroke',{
+      ownerId: myId,
+      layerNo: activeLayer,
+      segment: seg
+    });
+
+    currentStrokeSegments.push(seg);
+    prev = q;
+  }
+
+  lastPoint = p;
+}
+
 let lastPoint = null;
 
 canvas.addEventListener('pointerdown', e=>{
@@ -657,7 +885,11 @@ canvas.addEventListener('pointerdown', e=>{
   smoothPoint = null;
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
-  lastPoint = smooth(canvasPointFromEvent(e));
+
+  const start = canvasPointFromEvent(e);
+  smoothPoint = {...start};
+  lastPoint = {...start};
+
   canvas.setPointerCapture?.(e.pointerId);
 });
 
@@ -671,43 +903,68 @@ canvas.addEventListener('pointermove', e=>{
 
   if(!drawing) return;
 
-  const p = smooth(canvasPointFromEvent(e));
+  // 스타일러스/고주사율 마우스는 브라우저가 모아둔 중간 이벤트까지 사용.
+  const events = typeof e.getCoalescedEvents === 'function'
+    ? e.getCoalescedEvents()
+    : [e];
 
-  const seg = {
-    strokeId:currentStrokeId,
-    x1:lastPoint.x,
-    y1:lastPoint.y,
-    x2:p.x,
-    y2:p.y,
-    width:getStyledWidth(p.pressure),
-    color:colorInput.value,
-    opacity:Number(opacityInput.value)/100,
-    eraser:tool==='eraser'
-  };
-
-  drawSegment(seg);
-
-  broadcast('stroke',{
-    ownerId:myId,
-    layerNo:activeLayer,
-    segment:seg
-  });
-
-  currentStrokeSegments.push(seg);
-  lastPoint = p;
+  for(const ev of events){
+    emitDrawPoint(canvasPointFromEvent(ev));
+  }
 });
 
-window.addEventListener('pointerup', async ()=>{
-  if(drawing && currentStrokeSegments.length){
-    const toSave = currentStrokeSegments.slice();
-    currentStrokeSegments = [];
-    await persistStroke(toSave);
+window.addEventListener('pointerup', async e=>{
+  if(drawing){
+    // 보정 때문에 끝점이 덜 따라온 경우 실제 손을 뗀 위치까지 자연스럽게 마무리.
+    if(e && typeof e.clientX === 'number'){
+      const endRaw = canvasPointFromEvent(e);
+      const oldSmooth = smoothingInput.value;
+
+      // 마지막 한 번은 약한 보정으로 끝점까지 붙임
+      const savedPoint = smoothPoint;
+      smoothPoint = {
+        x: lastPoint?.x ?? endRaw.x,
+        y: lastPoint?.y ?? endRaw.y,
+        pressure: endRaw.pressure
+      };
+      emitDrawPoint(endRaw);
+    }
+
+    // 클릭/짧은 탭도 점으로 남게 함
+    if(currentStrokeSegments.length === 0 && lastPoint){
+      const r = Math.max(0.6, getStyledWidth(lastPoint.pressure) / 2);
+      const seg = {
+        strokeId: currentStrokeId,
+        x1: lastPoint.x - 0.01,
+        y1: lastPoint.y,
+        x2: lastPoint.x + 0.01,
+        y2: lastPoint.y,
+        width: r * 2,
+        color: colorInput.value,
+        opacity: Number(opacityInput.value) / 100,
+        eraser: tool === 'eraser'
+      };
+      drawSegment(seg);
+      broadcast('stroke',{
+        ownerId:myId,
+        layerNo:activeLayer,
+        segment:seg
+      });
+      currentStrokeSegments.push(seg);
+    }
+
+    if(currentStrokeSegments.length){
+      const toSave = currentStrokeSegments.slice();
+      currentStrokeSegments = [];
+      await persistStroke(toSave);
+    }
   }
 
   drawing=false;
   panning=false;
   panStart=null;
   smoothPoint=null;
+  lastPoint=null;
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
 });
 

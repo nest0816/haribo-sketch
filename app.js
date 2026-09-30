@@ -110,6 +110,7 @@ function resetTransientState(){
   smoothPoint = null;
   panning = false;
   panStart = null;
+  panPointerId = null;
   remoteStrokeBuffers.clear();
   completedStrokeIds.clear();
   deletedRowIds.clear();
@@ -193,6 +194,7 @@ let pan = {x:0,y:0};
 let spaceDown = false;
 let panning = false;
 let panStart = null;
+let panPointerId = null;
 let smoothPoint = null;
 let currentStrokeId = null;
 let currentStrokeSegments = [];
@@ -1346,6 +1348,17 @@ function renderParticipants(list){
   });
 }
 
+function updateChatGrouping(){
+  let previous=null;
+  for(const element of chatMessagesEl.children){
+    const row=element.chatRow;
+    if(!row){previous=null;continue;}
+    const continuation=Boolean(previous?.client_id && row.client_id===previous.client_id && row.nickname===previous.nickname);
+    element.classList.toggle('continuation',continuation);
+    previous=row;
+  }
+}
+
 function renderChat(rows){
   chatOlderBtn.disabled=!rows.length;
   chatLatestBtn.hidden=chatAtLatest;
@@ -1393,6 +1406,7 @@ function appendChat(row,fromHistory=false){
     if(first.chatRow?.id != null) chatIds.delete(String(first.chatRow.id));
     first.remove();
   }
+  updateChatGrouping();
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
 }
 
@@ -1669,8 +1683,11 @@ let lastPoint = null;
 canvas.addEventListener('pointerdown', e=>{
   if(configured && (!roomReady || !channelReady || resettingRoom)) return;
   if(e.pointerType === 'mouse' && e.button !== 0) return;
+  if(activePointerId !== null || panning) return;
   if(spaceDown || tool==='hand'){
     panning = true;
+    panPointerId=e.pointerId;
+    canvas.setPointerCapture?.(e.pointerId);
     panStart = {x:e.clientX-pan.x,y:e.clientY-pan.y};
     canvas.style.cursor='grabbing';
     return;
@@ -1713,8 +1730,27 @@ canvas.addEventListener('pointerdown', e=>{
 
 
 
+function stopCanvasPan(pointerId){
+  if(!panning) return;
+  if(pointerId != null && pointerId !== panPointerId) return;
+  const capturedId=panPointerId;
+  panning=false;
+  panStart=null;
+  panPointerId=null;
+  canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
+  if(capturedId != null && canvas.hasPointerCapture?.(capturedId)){
+    canvas.releasePointerCapture?.(capturedId);
+  }
+}
+
 function handleDrawMove(e){
   if(panning && panStart){
+    if(e.pointerId !== panPointerId) return;
+    if((e.pointerType==='mouse' || e.pointerType==='pen') && !(e.buttons & 1)){
+      stopCanvasPan(e.pointerId);
+      return;
+    }
+    e.preventDefault();
     pan.x = e.clientX-panStart.x;
     pan.y = e.clientY-panStart.y;
     updateTransform();
@@ -1752,6 +1788,7 @@ async function saveFinishedStroke(segments,layerNo,targetRoom,generation){
 
 
 function finishStrokeImmediately(pointerId){
+  stopCanvasPan(pointerId);
   if(activePointerId === null) return;
   if(pointerId !== undefined && pointerId !== null && pointerId !== activePointerId) return;
 
@@ -1776,6 +1813,7 @@ function finishStrokeImmediately(pointerId){
   activePointerId = null;
   panning = false;
   panStart = null;
+  panPointerId = null;
   smoothPoint = null;
   lastPoint = null;
   lastInputTime = 0;
@@ -2034,6 +2072,7 @@ window.addEventListener('keydown', async e=>{
 window.addEventListener('keyup',e=>{
   if(e.code==='Space'){
     spaceDown=false;
+    stopCanvasPan();
     canvas.style.cursor=tool==='hand'?'grab':'crosshair';
   }
 });
@@ -2131,4 +2170,48 @@ document.addEventListener('visibilitychange',()=>{
     heartbeatRoomMember().catch(console.error);
     Promise.all([loadRoomHistory(),loadChatHistory()]).catch(console.error);
   }else if(!roomId && supabaseClient) fetchFixedRoomCounts().catch(console.error);
+});
+
+// Drag the bottom grip to resize the message area; retain the preferred height.
+const chatResizeHandle=document.getElementById('chatResizeHandle');
+const CHAT_HEIGHT_KEY='haribo-chat-height-v1';
+let chatResize=null;
+function setChatHeight(value){
+  const height=Math.max(180,Math.min(1600,value));
+  chatMessagesEl.style.height=`${height}px`;
+  chatMessagesEl.style.minHeight=`${height}px`;
+  return height;
+}
+const savedChatHeight=Number(localStorage.getItem(CHAT_HEIGHT_KEY));
+if(Number.isFinite(savedChatHeight) && savedChatHeight>=180) setChatHeight(savedChatHeight);
+function endChatResize(e){
+  if(!chatResize || (e?.pointerId != null && e.pointerId!==chatResize.pointerId)) return;
+  const id=chatResize.pointerId;
+  chatResize=null;
+  document.body.classList.remove('chat-resizing');
+  localStorage.setItem(CHAT_HEIGHT_KEY,String(chatMessagesEl.getBoundingClientRect().height));
+  if(chatResizeHandle.hasPointerCapture?.(id)) chatResizeHandle.releasePointerCapture(id);
+}
+chatResizeHandle.addEventListener('pointerdown',e=>{
+  if(e.pointerType==='mouse' && e.button!==0) return;
+  e.preventDefault();
+  chatResize={pointerId:e.pointerId,y:e.clientY,height:chatMessagesEl.getBoundingClientRect().height};
+  chatResizeHandle.setPointerCapture?.(e.pointerId);
+  document.body.classList.add('chat-resizing');
+});
+chatResizeHandle.addEventListener('pointermove',e=>{
+  if(!chatResize || e.pointerId!==chatResize.pointerId) return;
+  if((e.pointerType==='mouse'||e.pointerType==='pen') && !(e.buttons & 1)){endChatResize(e);return;}
+  e.preventDefault();
+  setChatHeight(chatResize.height+e.clientY-chatResize.y);
+});
+chatResizeHandle.addEventListener('pointerup',endChatResize);
+chatResizeHandle.addEventListener('pointercancel',endChatResize);
+chatResizeHandle.addEventListener('lostpointercapture',endChatResize);
+window.addEventListener('blur',()=>endChatResize());
+chatResizeHandle.addEventListener('keydown',e=>{
+  if(e.key!=='ArrowUp' && e.key!=='ArrowDown') return;
+  e.preventDefault();
+  const height=setChatHeight(chatMessagesEl.getBoundingClientRect().height+(e.key==='ArrowDown'?30:-30));
+  localStorage.setItem(CHAT_HEIGHT_KEY,String(height));
 });

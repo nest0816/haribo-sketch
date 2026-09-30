@@ -58,6 +58,123 @@ let currentStrokeOpacity = 1;
 let currentStrokeIsEraser = false;
 
 const remoteStrokeBuffers = new Map();
+const completedStrokeIds = new Set();
+let remoteFrame = null;
+let roomGeneration = 0;
+let roomReady = false;
+let channelReady = false;
+let joiningRoom = false;
+let leavingRoom = false;
+let historyLoading = null;
+let chatLoading = null;
+let mutationQueue = Promise.resolve();
+let reconciliationTimer = null;
+let heartbeatInFlight = false;
+let heartbeatRequest = null;
+const deletedRowIds = new Set();
+const pendingCommits = new Map();
+const pendingLocalStrokes = new Map();
+let lobbyCountInFlight = false;
+let chatSending = false;
+let chatAtLatest = true;
+let unreadChatCount = 0;
+let chatPagingInFlight = false;
+const chatOlderBtn = document.getElementById('chatOlderBtn');
+const chatLatestBtn = document.getElementById('chatLatestBtn');
+let leaveSent = false;
+let strokeLayer = 1;
+let strokeGeneration = 0;
+const chatIds = new Set();
+const MAX_CHAT_ROWS = 200;
+const HISTORY_PAGE_SIZE = 500;
+const MAX_BATCH_SEGMENTS = 160;
+
+function enqueueMutation(work){
+  const next = mutationQueue.then(work);
+  mutationQueue = next.catch(err => {
+    console.error('room mutation failed', err);
+    showStatus('저장 오류 — 연결을 확인해주세요', true);
+  });
+  return mutationQueue;
+}
+
+function resetTransientState(){
+  if(networkFlushTimer !== null) clearTimeout(networkFlushTimer);
+  networkFlushTimer = null;
+  networkSegmentBuffer = [];
+  drawing = false;
+  activePointerId = null;
+  currentStrokeSegments = [];
+  currentStrokeId = null;
+  lastPoint = null;
+  smoothPoint = null;
+  panning = false;
+  panStart = null;
+  remoteStrokeBuffers.clear();
+  completedStrokeIds.clear();
+  deletedRowIds.clear();
+  pendingCommits.clear();
+  pendingLocalStrokes.clear();
+  chatAtLatest=true;
+  unreadChatCount=0;
+  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
+  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
+}
+
+function uniquePeople(list){
+  return [...new Map(list.filter(p=>p?.id).map(p=>[p.id,p])).values()];
+}
+function currentPeople(){
+  return uniquePeople(Object.values(channel?.presenceState?.() || {}).flat());
+}
+
+function previewInterval(){
+  // Budget includes delivery fan-out; reserve other traffic outside this budget.
+  const n = Math.max(1, currentPeople().length);
+  const budget = Math.max(30, Number(cfg.REALTIME_ROOM_MESSAGE_BUDGET) || 600);
+  return Math.max(100, Math.ceil(n*n*1000/budget));
+}
+
+function scheduleRemoteDraw(){
+  if(remoteFrame !== null) return;
+  remoteFrame = requestAnimationFrame(()=>{
+    remoteFrame = null;
+    redrawRemoteStrokes();
+  });
+}
+
+// A cropped opaque buffer per active stroke avoids replaying its entire path.
+function appendRemoteSegments(stroke, segments){
+  const pad = 128;
+  let left = stroke.left ?? WIDTH, top = stroke.top ?? HEIGHT;
+  let right = stroke.right ?? 0, bottom = stroke.bottom ?? 0;
+  for(const seg of segments){
+    const margin = seg.width/2 + 2;
+    left = Math.min(left, Math.max(0, Math.floor(Math.min(seg.x1,seg.x2)-margin)));
+    top = Math.min(top, Math.max(0, Math.floor(Math.min(seg.y1,seg.y2)-margin)));
+    right = Math.max(right, Math.min(WIDTH, Math.ceil(Math.max(seg.x1,seg.x2)+margin)));
+    bottom = Math.max(bottom, Math.min(HEIGHT, Math.ceil(Math.max(seg.y1,seg.y2)+margin)));
+  }
+  if(!stroke.buffer || left < stroke.left || top < stroke.top || right > stroke.right || bottom > stroke.bottom){
+    const old = stroke.buffer, oldLeft = stroke.left, oldTop = stroke.top;
+    stroke.left = Math.max(0, Math.floor(left/pad)*pad);
+    stroke.top = Math.max(0, Math.floor(top/pad)*pad);
+    stroke.right = Math.min(WIDTH, Math.ceil(right/pad)*pad);
+    stroke.bottom = Math.min(HEIGHT, Math.ceil(bottom/pad)*pad);
+    stroke.buffer = document.createElement('canvas');
+    stroke.buffer.width = Math.max(1,stroke.right-stroke.left);
+    stroke.buffer.height = Math.max(1,stroke.bottom-stroke.top);
+    stroke.context = stroke.buffer.getContext('2d');
+    if(old) stroke.context.drawImage(old, oldLeft-stroke.left, oldTop-stroke.top);
+  }
+  stroke.context.save();
+  stroke.context.translate(-stroke.left,-stroke.top);
+  segments.forEach(seg=>drawOpaqueSegment(stroke.context,seg));
+  stroke.context.restore();
+  stroke.segments.push(...segments);
+  stroke.updatedAt = Date.now();
+}
+
 
 const kickVoteCounts = new Map();
 const myKickVotes = new Set();
@@ -80,7 +197,6 @@ let smoothPoint = null;
 let currentStrokeId = null;
 let currentStrokeSegments = [];
 let activePointerId = null;
-let rawPointHistory = [];
 let networkSegmentBuffer = [];
 let networkFlushTimer = null;
 let lastInputTime = 0;
@@ -189,9 +305,6 @@ addLayerBtn.onclick = ()=>{
 renderLayers();
 
 function clearCanvas(){
-  remoteStrokeBuffers.clear();
-  remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
 
   ctx.save();
   ctx.globalAlpha = 1;
@@ -345,32 +458,22 @@ function drawSegment(seg){
 
 function redrawRemoteStrokes(){
   remoteCtx.clearRect(0,0,WIDTH,HEIGHT);
-
-  for(const stroke of remoteStrokeBuffers.values()){
-    if(!stroke.segments.length) continue;
-
-    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
-
-    stroke.segments.forEach(seg=>{
-      drawOpaqueSegment(strokeBufferCtx, seg);
-    });
-
+  for(const [id,stroke] of remoteStrokeBuffers){
+    if(Date.now()-stroke.updatedAt > 30000){ remoteStrokeBuffers.delete(id); continue; }
+    if(!stroke.buffer) continue;
     remoteCtx.save();
     remoteCtx.globalAlpha = stroke.eraser ? 1 : stroke.opacity;
-    remoteCtx.globalCompositeOperation = 'source-over';
-    remoteCtx.drawImage(strokeBuffer,0,0);
+    remoteCtx.drawImage(stroke.buffer,stroke.left,stroke.top);
     remoteCtx.restore();
-
-    strokeBufferCtx.clearRect(0,0,WIDTH,HEIGHT);
   }
 }
 
 function receiveRemoteStrokeBatch(payload){
   const segments = Array.isArray(payload?.segments) ? payload.segments : [];
-  if(!segments.length) return;
+  if(!segments.length || segments.length>1000 || !segments.every(validSegment)) return;
 
   const strokeId = segments[0]?.strokeId || payload.strokeId;
-  if(!strokeId) return;
+  if(!strokeId || completedStrokeIds.has(strokeId)) return;
 
   let stroke = remoteStrokeBuffers.get(strokeId);
 
@@ -383,17 +486,20 @@ function receiveRemoteStrokeBatch(payload){
       eraser:Boolean(first.eraser),
       segments:[]
     };
+    if(remoteStrokeBuffers.size>=60) return;
     remoteStrokeBuffers.set(strokeId, stroke);
   }
 
-  stroke.segments.push(...segments);
-  redrawRemoteStrokes();
+  appendRemoteSegments(stroke, segments);
+  scheduleRemoteDraw();
 }
 
 function finishRemoteStroke(payload){
   const strokeId = payload?.strokeId;
   if(!strokeId) return;
 
+  if(completedStrokeIds.has(strokeId)) return;
+  completedStrokeIds.add(strokeId);
   const stroke = remoteStrokeBuffers.get(strokeId);
 
   // stroke_end에는 전체 획도 같이 보내므로,
@@ -403,24 +509,15 @@ function finishRemoteStroke(payload){
     : stroke?.segments;
 
   if(fullSegments?.length){
-    drawStrokeSegments(ctx, fullSegments);
+    if(payload.rowId != null && !cachedRows.some(r=>String(r.id)===String(payload.rowId))){
+      cachedRows.push({id:payload.rowId, client_id:payload.ownerId,
+        layer_no:payload.layerNo || 1, payload:{type:'stroke',segments:fullSegments}});
+    }
+    if(rowVisible({client_id:payload.ownerId,layer_no:payload.layerNo})) drawStrokeSegments(ctx, fullSegments);
   }
 
   remoteStrokeBuffers.delete(strokeId);
-  redrawRemoteStrokes();
-}
-
-function redrawLiveStroke(){
-  liveCtx.clearRect(0,0,WIDTH,HEIGHT);
-  if(!currentStrokeSegments.length) return;
-
-  // liveCanvas 자체는 불투명한 한 획.
-  // 투명도는 CSS가 아니라 병합할 때 한 번만 적용한다.
-  currentStrokeSegments.forEach(seg=>{
-    drawOpaqueSegment(liveCtx, seg);
-  });
-
-  liveCanvas.style.opacity = String(currentStrokeIsEraser ? 1 : currentStrokeOpacity);
+  scheduleRemoteDraw();
 }
 
 function rowVisible(row){
@@ -445,6 +542,7 @@ function redrawFromCache(){
       drawStrokeSegments(ctx, payload.segments);
     }
   });
+  for(const row of pendingLocalStrokes.values()) if(rowVisible(row)) drawStrokeSegments(ctx,row.payload.segments);
 }
 
 let channel = null;
@@ -466,9 +564,13 @@ let heartbeatTimer = null;
 let lobbyRefreshTimer = null;
 
 async function fetchFixedRoomCounts(){
-  if(!supabaseClient) return;
-
-  const { data, error } = await supabaseClient.rpc('fixed_public_room_counts');
+  if(!supabaseClient || lobbyCountInFlight) return;
+  lobbyCountInFlight = true;
+  let result;
+  try{result = await supabaseClient.rpc('fixed_public_room_counts_v25');}
+  catch(error){result={error};}
+  finally{lobbyCountInFlight = false;}
+  const {data,error} = result;
 
   if(error){
     console.error('fixed_public_room_counts failed', error);
@@ -560,18 +662,23 @@ function showLobby(){
   clearInterval(lobbyRefreshTimer);
   lobbyRefreshTimer = setInterval(()=>{
     if(!lobbyOverlay.classList.contains('hidden')){
-      fetchFixedRoomCounts();
+      if(!document.hidden) fetchFixedRoomCounts();
     }
-  }, 1000);
+  }, 5000 + Math.random()*1000);
 }
 
 document.querySelectorAll('.public-room-choice').forEach(btn=>{
   btn.addEventListener('click', async ()=>{
-    if(btn.disabled) return;
-    const ok = await joinFixedPublicRoom(btn.dataset.fixedRoom);
-    if(ok){
-      await enterCurrentRoom();
-    }
+    if(btn.disabled || joiningRoom || leavingRoom) return;
+    joiningRoom = true;
+    try{
+      const ok = await joinFixedPublicRoom(btn.dataset.fixedRoom);
+      if(ok) await enterCurrentRoom();
+    }catch(err){
+      console.error('join failed',err);
+      await returnToLobby();
+      showStatus('방 연결 오류',true);
+    }finally{ joiningRoom=false; }
   });
 });
 
@@ -592,48 +699,40 @@ async function registerPrivateRoomMember(){
 }
 
 async function heartbeatRoomMember(){
-  if(!supabaseClient || !roomId) return;
-
-  if(roomMode === 'public'){
-    const banned = await checkIfBannedFromRoom();
-    if(banned){
-      await handleKickedFromRoom();
+  if(!supabaseClient || !roomId || heartbeatInFlight) return;
+  heartbeatInFlight = true;
+  const generation=roomGeneration, targetRoom=roomId;
+  try{
+    heartbeatRequest = supabaseClient.rpc('heartbeat_room_member_v25',{
+      p_room_id:targetRoom,p_client_id:myId,p_nickname:myName
+    });
+    const {data,error}=await heartbeatRequest;
+    if(generation !== roomGeneration) return;
+    scheduleRemoteDraw();
+    for(const [id,entry] of pendingCommits) if(Date.now()-entry.updatedAt>30000) pendingCommits.delete(id);
+    if(error){ showStatus('접속 확인 오류',true); return; }
+    if(!data?.ok){
+      if(data?.reason==='banned') await handleKickedFromRoom();
+      else await returnToLobby();
       return;
     }
-  }
-
-  await supabaseClient.rpc('touch_room_member', {
-    p_room_id: roomId,
-    p_client_id: myId,
-    p_nickname: myName
-  });
-}
-
-async function refreshOccupancy(){
-  if(!supabaseClient || !roomId) return;
-
-  const { data, error } = await supabaseClient.rpc('room_active_count', {
-    p_room_id: roomId
-  });
-
-  if(!error && roomOccupancy){
-    roomOccupancy.textContent = String(data ?? 1);
-  }
+    if(data.expires_at){
+      const next = new Date(data.expires_at).getTime();
+      if(next > expiresAt) applyRoomExpiry(next);
+    }
+  }finally{ heartbeatInFlight=false; heartbeatRequest=null; }
 }
 
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
-  heartbeatRoomMember();
-  refreshOccupancy();
-
-  heartbeatTimer = setInterval(()=>{
-    heartbeatRoomMember();
-    refreshOccupancy();
-  }, 3000);
+  heartbeatRoomMember().catch(console.error);
+  heartbeatTimer = setInterval(()=>{heartbeatRoomMember().catch(console.error);},10000+Math.random()*1000);
 }
 
+
 function leaveRoomImmediately(){
-  if(!configured || !roomId || !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY) return;
+  if(leaveSent || !configured || !roomId || !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY) return;
+  leaveSent = true;
 
   const url = `${cfg.SUPABASE_URL}/rest/v1/rpc/leave_room_member`;
 
@@ -667,31 +766,60 @@ async function ensureRoom(){
 }
 
 async function loadRoomHistory(){
-  const { data, error } = await supabaseClient
-    .from('strokes')
-    .select('id, client_id, layer_no, payload, created_at')
-    .eq('room_id', roomId)
-    .order('id', { ascending:true });
-
-  if(error) throw error;
-
-  cachedRows = data || [];
-  redrawFromCache();
+  if(historyLoading) return historyLoading;
+  const targetRoom = roomId, generation = roomGeneration;
+  const promise = (async()=>{
+    let after = null;
+    const rows = [], initialIds = new Set(cachedRows.map(r=>String(r.id)));
+    for(;;){
+      let query = supabaseClient.from('strokes')
+        .select('id, client_id, layer_no, payload, created_at')
+        .eq('room_id',targetRoom).order('id',{ascending:true}).limit(HISTORY_PAGE_SIZE);
+      if(after !== null) query = query.gt('id',after);
+      const {data,error} = await query;
+      if(error) throw error;
+      if(generation !== roomGeneration) return;
+      rows.push(...(data || []));
+      if(!data?.length || data.length < HISTORY_PAGE_SIZE) break;
+      after = data[data.length-1].id;
+    }
+    if(generation !== roomGeneration) return;
+    // Keep rows delivered/saved while the paginated snapshot was in flight.
+    const byId = new Map(rows.map(r=>[String(r.id),r]));
+    for(const row of cachedRows) if(!initialIds.has(String(row.id))) byId.set(String(row.id),row);
+    cachedRows = [...byId.values()].filter(r=>!deletedRowIds.has(String(r.id)));
+    for(const row of cachedRows){
+      const id = row.payload?.segments?.[0]?.strokeId;
+      if(id){ completedStrokeIds.add(id); remoteStrokeBuffers.delete(id); pendingCommits.delete(id); }
+    }
+    redrawFromCache();
+    scheduleRemoteDraw();
+  })();
+  historyLoading = promise;
+  try{ await promise; }finally{ if(historyLoading===promise) historyLoading=null; }
 }
 
 async function loadChatHistory(){
-  const { data, error } = await supabaseClient
-    .from('chat_messages')
-    .select('id, client_id, nickname, message, created_at')
-    .eq('room_id', roomId)
-    .order('id', { ascending:true });
-
-  if(error) throw error;
-
-  renderChat(data || []);
+  if(!chatAtLatest) return;
+  if(chatLoading) return chatLoading;
+  const targetRoom=roomId, generation=roomGeneration;
+  const promise=(async()=>{
+    const {data,error} = await supabaseClient.from('chat_messages')
+      .select('id, client_id, nickname, message, created_at').eq('room_id',targetRoom)
+      .order('id',{ascending:false}).limit(MAX_CHAT_ROWS);
+    if(error) throw error;
+    if(generation !== roomGeneration) return;
+    // Merge history with messages broadcast during the request.
+    const live = [...chatMessagesEl.children].map(el=>el.chatRow).filter(Boolean);
+    const rows = new Map([...(data||[]).reverse(),...live].map(r=>[String(r.id),r]));
+    renderChat([...rows.values()].sort((a,b)=>Number(a.id)-Number(b.id)).slice(-MAX_CHAT_ROWS));
+  })();
+  chatLoading=promise;
+  try{await promise;}finally{if(chatLoading===promise) chatLoading=null;}
 }
 
-async function persistStroke(segments){
+
+async function persistStroke(segments, layerNo=activeLayer, targetRoom=roomId, generation=roomGeneration){
   if(!supabaseClient || !segments.length) return;
 
   const payload = {
@@ -700,9 +828,9 @@ async function persistStroke(segments){
   };
 
   const { data, error } = await supabaseClient.rpc('save_room_stroke', {
-    p_room_id: roomId,
+    p_room_id: targetRoom,
     p_client_id: myId,
-    p_layer_no: activeLayer,
+    p_layer_no: layerNo,
     p_payload: payload
   });
 
@@ -712,15 +840,19 @@ async function persistStroke(segments){
     return;
   }
 
+  if(generation !== roomGeneration) return;
+  pendingLocalStrokes.delete(segments[0].strokeId);
   cachedRows.push({
-    id:Number(data),
-    room_id:roomId,
+    id:data,
+    room_id:targetRoom,
     client_id:myId,
-    layer_no:activeLayer,
+    layer_no:layerNo,
     payload,
     created_at:new Date().toISOString()
   });
 
+  completedStrokeIds.add(segments[0].strokeId);
+  await broadcastCommittedStroke(segments,layerNo,data,generation);
   showStatus('실시간 연결됨');
 }
 
@@ -738,8 +870,9 @@ async function deleteMyDrawings(){
     return;
   }
 
-  await loadRoomHistory();
-  broadcast('owner_clear', { ownerId: myId });
+  const rowIds = cachedRows.filter(r=>r.client_id===myId).map(r=>r.id);
+  applyOwnerClear({ownerId:myId,rowIds});
+  broadcast('owner_clear', { ownerId: myId, rowIds });
   showStatus(`내 그림 삭제됨 (${Number(data || 0)}개)`);
   setTimeout(()=>showStatus('실시간 연결됨'), 1200);
 }
@@ -765,8 +898,8 @@ async function undoMyLastStroke(){
     return;
   }
 
-  await loadRoomHistory();
-  broadcast('owner_undo', { ownerId: myId, strokeId: Number(data) });
+  applyOwnerUndo({ownerId:myId,strokeId:data});
+  broadcast('owner_undo', { ownerId: myId, strokeId: data });
   showStatus('마지막 선 되돌림');
   setTimeout(()=>showStatus('실시간 연결됨'), 1000);
 }
@@ -780,7 +913,7 @@ async function applyNicknameChange(nextName){
   localStorage.setItem(NICKNAME_KEY, myName);
   updateRoomLabels();
 
-  if(channel){
+  if(channel && channelReady){
     await channel.track({
       id:myId,
       name:myName,
@@ -804,28 +937,75 @@ nicknameBtn?.addEventListener('click', async ()=>{
 });
 
 async function enterCurrentRoom(){
+  roomGeneration++;
+  const enteringGeneration=roomGeneration, enteringRoom=roomId;
+  roomReady=false;
+  leaveSent=false;
+  historyLoading=null;
+  chatLoading=null;
+  cachedRows=[];
+  resetTransientState();
+  renderChat([]);
   showStatus('그림 불러오는 중…');
-
-  await ensureRoom();
-  await registerPrivateRoomMember();
-  await Promise.all([loadRoomHistory(), loadChatHistory()]);
+  if(roomMode !== 'public'){
+    await ensureRoom();
+    await registerPrivateRoomMember();
+  }
   await connectRoomChannel();
+  if(enteringRoom!==roomId || enteringGeneration!==roomGeneration) return;
+  await Promise.all([loadRoomHistory(),loadChatHistory()]);
+  if(enteringRoom!==roomId || enteringGeneration!==roomGeneration) return;
+  roomReady=true;
+  showStatus('실시간 연결됨');
+  clearInterval(reconciliationTimer);
+  reconciliationTimer=setInterval(()=>{
+    if(channelReady && !document.hidden && !drawing){
+      Promise.all([loadRoomHistory(),loadChatHistory()]).catch(console.error);
+    }
+  },60000+Math.random()*15000);
 }
+
+function applyOwnerClear(payload){
+  if(payload.ownerId===myId) pendingLocalStrokes.clear();
+  const ids=payload.rowIds && new Set(payload.rowIds.map(String));
+  for(const row of cachedRows) if(row.client_id===payload.ownerId && (!ids || ids.has(String(row.id)))) deletedRowIds.add(String(row.id));
+  cachedRows=cachedRows.filter(row=>row.client_id!==payload.ownerId || (ids && !ids.has(String(row.id))));
+  redrawFromCache();
+}
+function applyOwnerUndo(payload){
+  deletedRowIds.add(String(payload.strokeId));
+  cachedRows=cachedRows.filter(row=>String(row.id)!==String(payload.strokeId));
+  redrawFromCache();
+}
+function applyRoomExpiry(next){
+  if(!Number.isFinite(next) || next <= expiresAt) return;
+  expiresAt=next;
+  roomGeneration++;
+  historyLoading=null; chatLoading=null;
+  resetTransientState(); clearCanvas(); cachedRows=[]; renderChat([]);
+  kickVoteCounts.clear(); myKickVotes.clear();
+  renderParticipants(currentPeople());
+}
+
 
 async function connectRoomChannel(){
   if(channel){
     try{ await supabaseClient.removeChannel(channel); }catch(e){}
   }
 
-  channel = supabaseClient.channel(`room:${roomId}`, {
+  channelReady = false;
+  const connectedRoom=roomId;
+  const roomChannel = supabaseClient.channel(`room:${roomId}`, {
     config:{
-      broadcast:{self:false},
+      broadcast:{self:false,ack:true},
       presence:{key:myId}
     }
   });
 
-  channel
+  channel=roomChannel;
+  roomChannel
     .on('broadcast',{event:'stroke'}, ({payload}) => {
+      if(roomChannel !== channel) return;
       // 이전 버전 클라이언트 호환
       if(payload.ownerId === myId) return;
       if(payload.segment){
@@ -836,24 +1016,40 @@ async function connectRoomChannel(){
         });
       }
     })
+    .on('broadcast',{event:'stroke_batch_v25'}, ({payload}) => {
+      if(roomChannel !== channel) return;
+      if(payload?.ownerId===myId || !Array.isArray(payload?.points) || payload.points.length>MAX_BATCH_SEGMENTS) return;
+      receiveRemoteStrokeBatch({...payload,segments:unpackSegments(payload.points,payload.strokeId)});
+    })
     .on('broadcast',{event:'stroke_batch'}, ({payload}) => {
+      if(roomChannel !== channel) return;
       if(payload.ownerId === myId) return;
       receiveRemoteStrokeBatch(payload);
     })
+    .on('broadcast',{event:'stroke_commit_v25'}, ({payload}) => {
+      if(roomChannel !== channel) return;
+      if(payload.ownerId===myId) return;
+      receiveCommittedStroke(payload);
+    })
     .on('broadcast',{event:'stroke_end'}, ({payload}) => {
+      if(roomChannel !== channel) return;
       if(payload.ownerId === myId) return;
       finishRemoteStroke(payload);
     })
-    .on('broadcast',{event:'owner_clear'}, async () => {
-      await loadRoomHistory();
+    .on('broadcast',{event:'owner_clear'}, ({payload}) => {
+      if(roomChannel !== channel) return;
+      applyOwnerClear(payload);
     })
-    .on('broadcast',{event:'owner_undo'}, async () => {
-      await loadRoomHistory();
+    .on('broadcast',{event:'owner_undo'}, ({payload}) => {
+      if(roomChannel !== channel) return;
+      applyOwnerUndo(payload);
     })
     .on('broadcast',{event:'chat'}, ({payload}) => {
+      if(roomChannel !== channel) return;
       appendChat(payload);
     })
     .on('broadcast',{event:'kick_vote'}, ({payload}) => {
+      if(roomChannel !== channel) return;
       if(!payload?.targetId) return;
 
       kickVoteCounts.set(payload.targetId, Number(payload.voteCount || 0));
@@ -866,46 +1062,63 @@ async function connectRoomChannel(){
       const people = Object.values(channel.presenceState()).flat();
       renderParticipants(people);
     })
-    .on('broadcast',{event:'room_expired'}, async ({payload}) => {
-      clearCanvas();
-      cachedRows = [];
-      renderChat([]);
-      if(payload?.expiresAt){
-        expiresAt = payload.expiresAt;
-      }else{
-        await ensureRoom();
-      }
+    .on('broadcast',{event:'room_expired'}, ({payload}) => {
+      if(roomChannel !== channel) return;
+      if(roomChannel !== channel) return;
+      applyRoomExpiry(Number(payload?.expiresAt));
     })
     .on('presence',{event:'sync'}, () => {
-      const state = channel.presenceState();
-      const people = Object.values(state).flat();
+      if(roomChannel !== channel) return;
+      const people=currentPeople();
       renderParticipants(people);
-      if(roomOccupancy) roomOccupancy.textContent = String(people.length);
+      if(roomOccupancy) roomOccupancy.textContent=String(people.length);
     });
 
-  await channel.subscribe(async status => {
-    if(status === 'SUBSCRIBED'){
-      showStatus('실시간 연결됨');
-      await channel.track({
-        id:myId,
-        name:myName,
-        joined_at:new Date().toISOString()
-      });
-      startHeartbeat();
-    }else{
-      showStatus(status.toLowerCase());
-    }
+  await new Promise((resolve,reject)=>{
+    let subscribedOnce=false;
+    const timeout=setTimeout(()=>reject(new Error('Realtime subscribe timeout')),15000);
+    roomChannel.subscribe(async status=>{
+      if(roomChannel !== channel || connectedRoom !== roomId) return;
+      if(status==='SUBSCRIBED'){
+        channelReady=true;
+        clearTimeout(timeout);
+        try{
+          // Jitter prevents a simultaneous join storm from bursting Presence.
+          await new Promise(r=>setTimeout(r,Math.random()*1200));
+          if(roomChannel !== channel){reject(new Error('Room changed during subscribe'));return;}
+          await roomChannel.track({id:myId,name:myName});
+          startHeartbeat();
+          if(subscribedOnce) await Promise.all([loadRoomHistory(),loadChatHistory()]);
+          subscribedOnce=true;
+          resolve();
+        }catch(err){reject(err);showStatus('방 동기화 오류',true);}
+      }else{
+        channelReady=false;
+        showStatus(status.toLowerCase());
+        if(!subscribedOnce && (status==='CHANNEL_ERROR' || status==='TIMED_OUT' || status==='CLOSED')){
+          clearTimeout(timeout);reject(new Error(status));
+        }
+      }
+    });
   });
 }
 
 
 async function returnToLobby(){
-  // 이미 로비면 새로고침하지 않고 그대로 둠
-  if(!roomId){
-    showLobby();
-    return;
-  }
-
+  if(leavingRoom) return;
+  leavingRoom=true;
+  try{
+  roomReady=false;
+  finishStrokeImmediately(activePointerId);
+  clearInterval(heartbeatTimer);
+  clearInterval(reconciliationTimer);
+  await mutationQueue;
+  if(heartbeatRequest){try{await heartbeatRequest;}catch(e){}}
+  channelReady=false;
+  roomGeneration++;
+  resetTransientState();
+  cachedRows=[]; renderChat([]);
+  if(!roomId){showLobby();return;}
   // 정상적인 버튼 이동이므로 keepalive에만 의존하지 않고
   // Supabase에서 현재 멤버를 즉시 제거.
   if(supabaseClient){
@@ -952,6 +1165,7 @@ async function returnToLobby(){
   updateRoomLabels();
   showStatus('공개방 선택 대기');
   showLobby();
+  }finally{leavingRoom=false;}
 }
 
 brandHome?.addEventListener('click', ()=>{
@@ -1013,52 +1227,17 @@ async function castKickVote(targetId, targetName, button){
   }
 }
 
-async function checkIfBannedFromRoom(){
-  if(!supabaseClient || !roomId || roomMode !== 'public') return false;
-
-  const { data, error } = await supabaseClient.rpc('is_room_member_banned', {
-    p_room_id:roomId,
-    p_client_id:myId
-  });
-
-  if(error){
-    console.warn('ban check failed', error);
-    return false;
-  }
-
-  return Boolean(data);
-}
-
 async function handleKickedFromRoom(){
   if(kickedFromRoom) return;
-  kickedFromRoom = true;
-
-  showStatus('추방 투표 5표로 이 방에서 추방되었습니다.', true);
-
-  if(channel){
-    try{
-      await supabaseClient.removeChannel(channel);
-    }catch(e){}
-    channel = null;
-  }
-
-  clearInterval(heartbeatTimer);
-  heartbeatTimer = null;
-
-  roomId = null;
-  roomMode = 'lobby';
-  params.delete('room');
-  params.delete('public');
-  history.replaceState({}, '', location.pathname);
-
-  updateRoomLabels();
-  showLobby();
-
-  lobbyMessage.textContent = '추방된 방에는 이번 8분 동안 다시 들어갈 수 없어요.';
-  lobbyMessage.classList.add('error');
-
-  kickedFromRoom = false;
+  kickedFromRoom=true;
+  try{
+    await returnToLobby();
+    showStatus('추방 투표 5표로 이 방에서 추방되었습니다.',true);
+    lobbyMessage.textContent='추방된 방에는 이번 8분 동안 다시 들어갈 수 없어요.';
+    lobbyMessage.classList.add('error');
+  }finally{kickedFromRoom=false;}
 }
+
 
 async function setupRealtime(){
   if(!configured){
@@ -1115,11 +1294,13 @@ async function setupRealtime(){
     await enterCurrentRoom();
   }catch(err){
     console.error('setupRealtime failed:', err);
+    await returnToLobby();
     showStatus('방 연결 오류 — 새로고침해주세요', true);
   }
 }
 
 function renderParticipants(list){
+  list=uniquePeople(list);
   participantCountEl.textContent = list.length;
   participantsEl.innerHTML = '';
 
@@ -1166,7 +1347,10 @@ function renderParticipants(list){
 }
 
 function renderChat(rows){
+  chatOlderBtn.disabled=!rows.length;
+  chatLatestBtn.hidden=chatAtLatest;
   chatMessagesEl.innerHTML = '';
+  chatIds.clear();
   if(!rows.length){
     const empty = document.createElement('div');
     empty.className = 'chat-empty';
@@ -1174,15 +1358,24 @@ function renderChat(rows){
     chatMessagesEl.appendChild(empty);
     return;
   }
-  rows.forEach(appendChat);
+  rows.forEach(row=>appendChat(row,true));
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
 }
 
-function appendChat(row){
+function appendChat(row,fromHistory=false){
+  if(!chatAtLatest && !fromHistory){
+    unreadChatCount++;
+    chatLatestBtn.textContent=`최신 채팅 (${unreadChatCount})`;
+    chatLatestBtn.hidden=false;
+    return;
+  }
+  if(!row || (row.id != null && chatIds.has(String(row.id)))) return;
+  if(row.id != null) chatIds.add(String(row.id));
   const existingEmpty = chatMessagesEl.querySelector('.chat-empty');
   if(existingEmpty) existingEmpty.remove();
 
   const div = document.createElement('div');
+  div.chatRow=row;
   div.className = 'chat-msg' + (row.client_id === myId ? ' mine' : '');
 
   const name = document.createElement('b');
@@ -1195,23 +1388,59 @@ function appendChat(row){
   div.appendChild(name);
   div.appendChild(bubble);
   chatMessagesEl.appendChild(div);
+  while(chatMessagesEl.children.length > MAX_CHAT_ROWS){
+    const first=chatMessagesEl.firstElementChild;
+    if(first.chatRow?.id != null) chatIds.delete(String(first.chatRow.id));
+    first.remove();
+  }
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
 }
 
+// Page older messages while keeping the visible DOM bounded.
+chatOlderBtn.onclick=async()=>{
+  if(!supabaseClient || !roomReady || chatPagingInFlight) return;
+  const oldest=[...chatMessagesEl.children].find(el=>el.chatRow)?.chatRow?.id;
+  if(oldest == null) return;
+  chatPagingInFlight=true;
+  chatOlderBtn.disabled=true;
+  const generation=roomGeneration, targetRoom=roomId;
+  try{
+    const {data,error}=await supabaseClient.from('chat_messages')
+      .select('id, client_id, nickname, message, created_at').eq('room_id',targetRoom)
+      .lt('id',oldest).order('id',{ascending:false}).limit(MAX_CHAT_ROWS);
+    if(error) throw error;
+    if(generation!==roomGeneration) return;
+    if(!data?.length){chatOlderBtn.disabled=true;return;}
+    chatAtLatest=false;
+    renderChat(data.reverse());
+    chatLatestBtn.hidden=false;
+    chatMessagesEl.scrollTop=0;
+  }catch(err){console.error('older chat failed',err);showStatus('이전 채팅 조회 오류',true);chatOlderBtn.disabled=false;}
+  finally{chatPagingInFlight=false;}
+};
+chatLatestBtn.onclick=async()=>{
+  if(!supabaseClient || !roomReady || chatPagingInFlight) return;
+  chatAtLatest=true;unreadChatCount=0;chatLatestBtn.textContent='최신 채팅';
+  await loadChatHistory().catch(console.error);
+};
+
 async function sendChat(){
   const message = chatInput.value.trim();
-  if(!message || !supabaseClient) return;
-
+  if(!message || !supabaseClient || !roomReady || chatSending) return;
+  chatSending=true;
+  const targetRoom=roomId, generation=roomGeneration;
   chatSendBtn.disabled = true;
 
-  const { data, error } = await supabaseClient.rpc('send_room_chat', {
-    p_room_id: roomId,
+  let result;
+  try{result=await supabaseClient.rpc('send_room_chat', {
+    p_room_id: targetRoom,
     p_client_id: myId,
     p_nickname: myName,
-    p_message: message
-  });
-
-  chatSendBtn.disabled = false;
+    p_message: message.slice(0,200)
+  });}catch(error){result={error};}
+  finally{chatSending=false;chatSendBtn.disabled=false;}
+  if(generation !== roomGeneration) return;
+  const {data,error}=result;
 
   if(error){
     console.error('send_room_chat failed', error);
@@ -1226,10 +1455,10 @@ async function sendChat(){
     return;
   }
 
-  chatInput.value = '';
+  if(chatInput.value.trim()===message) chatInput.value = '';
 
   const row = {
-    id:Number(data),
+    id:data,
     client_id:myId,
     nickname:myName,
     message,
@@ -1249,45 +1478,87 @@ chatInput.addEventListener('keydown', e=>{
   }
 });
 
-function broadcast(event,payload={}){
-  if(channel) channel.send({type:'broadcast',event,payload});
+// Split exact final geometry below the Free-plan 256 KB payload limit.
+function validSegment(s){
+  return s && [s.x1,s.y1,s.x2,s.y2,s.width,s.opacity??1].every(Number.isFinite) &&
+    s.width>0 && s.width<=200 && typeof s.color==='string' && s.color.length<=32 &&
+    Math.abs(s.x1)<=WIDTH+200 && Math.abs(s.x2)<=WIDTH+200 &&
+    Math.abs(s.y1)<=HEIGHT+200 && Math.abs(s.y2)<=HEIGHT+200;
 }
+function packSegments(segments){
+  return segments.map(s=>[s.x1,s.y1,s.x2,s.y2,s.width,s.color,s.opacity,s.eraser]);
+}
+function unpackSegments(points,strokeId){
+  return points.map(p=>({strokeId,x1:p[0],y1:p[1],x2:p[2],y2:p[3],width:p[4],color:p[5],opacity:p[6],eraser:p[7]}));
+}
+async function broadcastCommittedStroke(segments,layerNo,rowId,generation){
+  const size=400, parts=Math.ceil(segments.length/size), strokeId=segments[0].strokeId;
+  for(let part=0;part<parts;part++){
+    if(generation!==roomGeneration) return;
+    await broadcast('stroke_commit_v25',{ownerId:myId,layerNo,rowId,strokeId,part,parts,
+      points:packSegments(segments.slice(part*size,(part+1)*size))});
+    if(part+1<parts) await new Promise(r=>setTimeout(r,previewInterval()));
+  }
+}
+function receiveCommittedStroke(payload){
+  if(!payload?.strokeId || completedStrokeIds.has(payload.strokeId)) return;
+  if(!Number.isInteger(payload.parts) || payload.parts<1 || payload.parts>10000 ||
+     !Number.isInteger(payload.part) || payload.part<0 || payload.part>=payload.parts ||
+     !Array.isArray(payload.points) || payload.points.length>400) return;
+  let entry=pendingCommits.get(payload.strokeId);
+  if(!entry){
+    if(pendingCommits.size>=60) return;
+    entry={chunks:new Map(),parts:payload.parts,updatedAt:Date.now()};
+    pendingCommits.set(payload.strokeId,entry);
+  }
+  const decoded=unpackSegments(payload.points,payload.strokeId);
+  if(!decoded.every(validSegment)) return;
+  entry.chunks.set(payload.part,decoded);
+  entry.updatedAt=Date.now();
+  if(entry.chunks.size===entry.parts){
+    const segments=[];
+    for(let i=0;i<entry.parts;i++) segments.push(...entry.chunks.get(i));
+    pendingCommits.delete(payload.strokeId);
+    finishRemoteStroke({...payload,segments});
+  }
+}
+
+function broadcast(event,payload={}){
+  if(!channel || !channelReady) return Promise.resolve(false);
+  const sendingChannel=channel;
+  return Promise.resolve(sendingChannel.send({type:'broadcast',event,payload})).then(status=>{
+    if(status !== 'ok' && sendingChannel===channel) showStatus('동기화 지연 — 저장된 그림은 재연결 시 복구됩니다',true);
+    return status==='ok';
+  }).catch(err=>{console.warn('broadcast failed',err);return false;});
+}
+
 
 let resettingRoom = false;
 
 async function resetExpiredRoom(){
-  if(resettingRoom) return;
-  resettingRoom = true;
-
+  if(resettingRoom || !roomId || !roomReady) return;
+  resettingRoom=true;
+  const generation=roomGeneration, targetRoom=roomId;
   try{
-    clearCanvas();
-    cachedRows = [];
-    renderChat([]);
-
-    if(!supabaseClient){
-      expiresAt = Date.now() + ROOM_LIFETIME_MS;
-      return;
-    }
-
-    const { data, error } = await supabaseClient.rpc('reset_room_8min', {
-      p_room_id: roomId,
-      p_room_type: roomMode === 'public' ? 'public' : 'private'
+    if(!supabaseClient){applyRoomExpiry(Date.now()+ROOM_LIFETIME_MS);return;}
+    const leader=currentPeople().map(p=>p.id).sort()[0];
+    if(leader && leader!==myId) await new Promise(r=>setTimeout(r,1500+Math.random()*1500));
+    if(generation!==roomGeneration || expiresAt>Date.now()) return;
+    const {data,error}=await supabaseClient.rpc('reset_room_if_expired_v25',{
+      p_room_id:targetRoom,p_room_type:roomMode==='public'?'public':'private'
     });
-
-    if(error){
-      console.error('reset_room_8min failed', error);
-      showStatus('방 초기화 오류', true);
-      return;
-    }
-
-    expiresAt = new Date(data).getTime();
-    broadcast('room_expired',{ expiresAt });
-  }finally{
-    resettingRoom = false;
-  }
+    if(error) throw error;
+    if(generation!==roomGeneration) return;
+    const next=new Date(data.expires_at).getTime();
+    applyRoomExpiry(next);
+    if(data.did_reset) broadcast('room_expired',{expiresAt:next});
+  }catch(err){console.error('room reset failed',err);showStatus('방 초기화 오류',true);}
+  finally{resettingRoom=false;}
 }
 
+
 function updateCountdown(){
+  if(!roomId){expiryCountdown.textContent='08:00';return;}
   let remaining = expiresAt - Date.now();
 
   if(remaining <= 0){
@@ -1316,7 +1587,7 @@ function queueNetworkSegment(seg){
 
   networkFlushTimer = window.setTimeout(()=>{
     flushNetworkSegments();
-  }, 30);
+  }, previewInterval());
 }
 
 function flushNetworkSegments(){
@@ -1327,13 +1598,17 @@ function flushNetworkSegments(){
 
   if(!networkSegmentBuffer.length) return;
 
-  const segments = networkSegmentBuffer.splice(0, networkSegmentBuffer.length);
+  const segments = networkSegmentBuffer.splice(0, MAX_BATCH_SEGMENTS);
 
-  broadcast('stroke_batch',{
+  broadcast('stroke_batch_v25',{
     ownerId:myId,
-    layerNo:activeLayer,
-    segments
+    layerNo:strokeLayer,
+    strokeId:segments[0].strokeId,
+    points:packSegments(segments)
   });
+  if(networkSegmentBuffer.length){
+    networkFlushTimer=setTimeout(flushNetworkSegments,previewInterval());
+  }
 }
 
 function emitDrawPoint(rawPoint){
@@ -1376,14 +1651,14 @@ function emitDrawPoint(rawPoint){
     y2:p.y,
     width:getStyledWidth(p.pressure),
     color:colorInput.value,
-    opacity:Number(opacityInput.value)/100,
-    eraser:tool==='eraser'
+    opacity:currentStrokeOpacity,
+    eraser:currentStrokeIsEraser
   };
 
   // 로컬 한 획은 liveCanvas에서 다시 그린다.
   // 반투명 조각들이 서로 겹치지 않도록 전체 획을 한 번에 표시.
   currentStrokeSegments.push(seg);
-  redrawLiveStroke();
+  drawOpaqueSegment(liveCtx,seg);
   queueNetworkSegment(seg);
 
   lastPoint = p;
@@ -1392,6 +1667,7 @@ function emitDrawPoint(rawPoint){
 let lastPoint = null;
 
 canvas.addEventListener('pointerdown', e=>{
+  if(configured && (!roomReady || !channelReady || resettingRoom)) return;
   if(e.pointerType === 'mouse' && e.button !== 0) return;
   if(spaceDown || tool==='hand'){
     panning = true;
@@ -1406,12 +1682,13 @@ canvas.addEventListener('pointerdown', e=>{
   activePointerId = e.pointerId;
   drawing = true;
   smoothPoint = null;
-  rawPointHistory = [];
   networkSegmentBuffer = [];
   if(networkFlushTimer !== null){
     clearTimeout(networkFlushTimer);
     networkFlushTimer = null;
   }
+  strokeLayer=activeLayer;
+  strokeGeneration=roomGeneration;
   currentStrokeId = crypto.randomUUID();
   currentStrokeSegments = [];
   currentStrokeOpacity = tool === 'eraser' ? 1 : Number(opacityInput.value)/100;
@@ -1465,16 +1742,23 @@ function handleDrawMove(e){
 canvas.addEventListener('pointermove', handleDrawMove, {passive:false});
 
 
-async function saveFinishedStroke(segments){
-  if(!segments || !segments.length) return;
-  await persistStroke(segments);
+async function saveFinishedStroke(segments,layerNo,targetRoom,generation){
+  if(!segments?.length) return;
+  return enqueueMutation(()=>{
+    if(generation !== roomGeneration) return;
+    return persistStroke(segments,layerNo,targetRoom,generation);
+  });
 }
+
 
 function finishStrokeImmediately(pointerId){
   if(activePointerId === null) return;
   if(pointerId !== undefined && pointerId !== null && pointerId !== activePointerId) return;
 
   const segmentsToSave = currentStrokeSegments.slice();
+  if(segmentsToSave.length && supabaseClient){
+    pendingLocalStrokes.set(segmentsToSave[0].strokeId,{client_id:myId,layer_no:strokeLayer,payload:{type:'stroke',segments:segmentsToSave}});
+  }
 
   // 손을 떼는 순간 현재 live 획을 메인 캔버스에 단 한 번 합성.
   if(segmentsToSave.length){
@@ -1485,15 +1769,6 @@ function finishStrokeImmediately(pointerId){
     ctx.restore();
   }
 
-  if(segmentsToSave.length){
-    broadcast('stroke_end',{
-      ownerId:myId,
-      layerNo:activeLayer,
-      strokeId:segmentsToSave[0]?.strokeId,
-      segments:segmentsToSave
-    });
-  }
-
   liveCtx.clearRect(0,0,WIDTH,HEIGHT);
   liveCanvas.style.opacity = '1';
 
@@ -1502,17 +1777,18 @@ function finishStrokeImmediately(pointerId){
   panning = false;
   panStart = null;
   smoothPoint = null;
-  rawPointHistory = [];
   lastPoint = null;
   lastInputTime = 0;
 
-  flushNetworkSegments();
+  if(networkFlushTimer !== null) clearTimeout(networkFlushTimer);
+  networkFlushTimer=null;
+  networkSegmentBuffer=[];
   currentStrokeSegments = [];
 
   canvas.style.cursor=(tool==='hand'||spaceDown)?'grab':'crosshair';
 
   if(segmentsToSave.length){
-    saveFinishedStroke(segmentsToSave);
+    saveFinishedStroke(segmentsToSave,strokeLayer,roomId,strokeGeneration);
   }
 }
 
@@ -1637,7 +1913,9 @@ document.querySelectorAll('.swatches button').forEach(btn=>{
 });
 
 document.getElementById('clearBtn').onclick=async ()=>{
-  await deleteMyDrawings();
+  if(configured && !roomReady) return;
+  finishStrokeImmediately(activePointerId);
+  await enqueueMutation(deleteMyDrawings);
 };
 
 document.getElementById('saveBtn').onclick=()=>{
@@ -1722,7 +2000,9 @@ window.addEventListener('keydown', async e=>{
   // Ctrl/Cmd + Z : 내 마지막 스트로크만 되돌리기
   if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'){
     e.preventDefault();
-    await undoMyLastStroke();
+    if(configured && !roomReady) return;
+    finishStrokeImmediately(activePointerId);
+    await enqueueMutation(undoMyLastStroke);
     return;
   }
 
@@ -1796,6 +2076,8 @@ window.addEventListener('pointercancel', e=>{
 
 // 탭 닫기/페이지 이동 시 DB의 방 인원에서도 즉시 제거
 window.addEventListener('pagehide', ()=>{
+  clearInterval(heartbeatTimer);
+  clearInterval(reconciliationTimer);
   leaveRoomImmediately();
 });
 
@@ -1839,3 +2121,14 @@ updateBrushCursorSize();
 
 // Initial tool size UI
 syncToolSettingsUI();
+
+window.addEventListener('pageshow',e=>{
+  if(e.persisted && configured) location.reload();
+});
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden) finishStrokeImmediately(activePointerId);
+  else if(roomId && channelReady){
+    heartbeatRoomMember().catch(console.error);
+    Promise.all([loadRoomHistory(),loadChatHistory()]).catch(console.error);
+  }else if(!roomId && supabaseClient) fetchFixedRoomCounts().catch(console.error);
+});

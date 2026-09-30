@@ -201,6 +201,10 @@
 
         <section class="chat-section">
           <div class="section-title-row"><h2>채팅</h2><span class="chat-live-label">LIVE</span></div>
+          <div class="chat-history-controls">
+            <button id="chatOlderBtn" class="mini" type="button">이전 채팅</button>
+            <button id="chatLatestBtn" class="mini" type="button" hidden>최신 채팅</button>
+          </div>
           <div id="chatMessages" class="chat-messages"></div>
           <div class="chat-compose">
             <input id="chatInput" type="text" maxlength="200" placeholder="메시지 입력…" />

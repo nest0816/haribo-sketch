@@ -512,3 +512,6 @@ canvas{
   transform:none;
   box-shadow:none;
 }
+
+.chat-history-controls{display:flex;gap:6px;margin:0 0 8px;}
+.chat-history-controls [hidden]{display:none;}
